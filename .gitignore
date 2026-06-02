@@ -16,6 +16,8 @@ build/
 # Supabase secrets, local state, generated data, and SQL files
 *.sql
 !*.example.sql
+!exam_templates_unmsm.sql
+!exam_templates_uni.sql
 supabase/
 *.db
 *.sqlite
