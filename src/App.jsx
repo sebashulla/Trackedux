@@ -241,6 +241,25 @@ const getUrgency = (course, examDate) => {
 
 const normalizeError = (error) => error?.message ?? 'Ocurrio un error inesperado.'
 
+const getAuthRedirectUrl = () => {
+  const configuredRedirect = import.meta.env.VITE_AUTH_REDIRECT_URL?.trim()
+  if (configuredRedirect) return configuredRedirect
+  return window.location.origin
+}
+
+const getAuthErrorMessageFromUrl = () => {
+  const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''))
+  const searchParams = new URLSearchParams(window.location.search)
+  const errorCode = hashParams.get('error_code') ?? searchParams.get('error_code')
+  const description = hashParams.get('error_description') ?? searchParams.get('error_description')
+
+  if (!errorCode && !description) return null
+  if (errorCode === 'otp_expired') {
+    return 'El enlace de confirmacion ya fue usado o expiro. Inicia sesion o solicita un correo nuevo.'
+  }
+  return description?.replace(/\+/g, ' ') ?? 'No se pudo completar la confirmacion del correo.'
+}
+
 function App() {
   const [session, setSession] = useState(null)
   const [profile, setProfile] = useState(null)
@@ -395,6 +414,12 @@ function App() {
     if (!isSupabaseConfigured || !supabase) return undefined
 
     let mounted = true
+    const authUrlError = getAuthErrorMessageFromUrl()
+
+    if (authUrlError) {
+      window.setTimeout(() => showToast(authUrlError, 'error'), 0)
+      window.history.replaceState(null, '', window.location.pathname)
+    }
 
     supabase.auth.getSession().then(({ data, error }) => {
       if (!mounted) return
@@ -473,6 +498,7 @@ function App() {
           email,
           password,
           options: {
+            emailRedirectTo: getAuthRedirectUrl(),
             data: { display_name: displayNameValue },
           },
         })
