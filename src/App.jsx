@@ -978,8 +978,8 @@ function App() {
     >
       {view === 'new-exam' ? (
         <section className="page-narrow reveal">
-          <p className="eyebrow">Crear preparacion</p>
-          <h1>Anade otro plan</h1>
+          <p className="eyebrow">Crear preparación</p>
+          <h1>Añade otro plan</h1>
           <TemplateSelector
             mode={creationMode}
             setMode={setCreationMode}
