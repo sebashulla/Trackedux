@@ -12,6 +12,7 @@ import {
   Clock,
   Code,
   ExternalLink,
+  FileDown,
   FileText,
   Flame,
   GraduationCap,
@@ -32,14 +33,25 @@ import {
   Target,
   Trash2,
   Trophy,
+  Upload,
   UserPlus,
   Users,
   X,
 } from 'lucide-react'
 import TemplateSelector from './components/TemplateSelector'
-import { EXAM_TEMPLATES, TOPIC_STATUS_OPTIONS, getExamTemplateByCode, getTemplateFormDefaults } from './data/examTemplates'
+import StatusBadge from './components/StatusBadge'
+import { EXAM_TEMPLATES, OFFICIAL_TEMPLATE_STRUCTURE_NOTE, TOPIC_STATUS_OPTIONS, getExamTemplateByCode, getTemplateFormDefaults } from './data/examTemplates'
 import { createPreparationFromTemplate } from './lib/templateService'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
+import {
+  TOPICS_CSV_TEMPLATE,
+  getCourseStatus,
+  getTopicStatus,
+  normalizeLookupKey,
+  normalizeStatus,
+  parseCsvTopics,
+  validateImportedTopicRows,
+} from './utils/helpers'
 import heroArt from './assets/hero.png'
 import logoArt from '../logo.png'
 import './App.css'
@@ -265,8 +277,6 @@ const isMissingColumnError = (error) => (
   || /column|schema cache/i.test(error?.message ?? '')
 )
 
-const getTopicStatus = (topic) => topic.status ?? (topic.done ? 'completado' : 'pendiente')
-
 const isCompletedTopic = (topic) => getTopicStatus(topic) === 'completado' || topic.done
 
 const TOPIC_GROUPS = [
@@ -287,6 +297,14 @@ const getTemplateForExam = (exam) => {
   )
 }
 
+const getTemplateNotice = (exam, template) => {
+  if (!template) return null
+  const sourceNote = exam?.sourceNote ?? template.sourceNote
+  if (!sourceNote) return OFFICIAL_TEMPLATE_STRUCTURE_NOTE
+  if (sourceNote.includes(OFFICIAL_TEMPLATE_STRUCTURE_NOTE)) return sourceNote
+  return `${sourceNote} ${OFFICIAL_TEMPLATE_STRUCTURE_NOTE}`
+}
+
 const isTemplatePreparation = (exam, template) => (
   exam?.templateCode === template.code
   || exam?.name?.toUpperCase().includes(template.shortName ?? template.slug?.toUpperCase())
@@ -298,6 +316,101 @@ const CONTACT_LINKS = {
   primaryEmail: 'sebastian.17shulla@gmail.com',
   secondaryEmail: 'sebas8shulla@outlook.es',
 }
+
+const ADMIN_USER_IDS = new Set(['66ec7f4b-ee05-42b4-81a6-482f044f6ea1'])
+const ANSWER_OPTIONS = ['A', 'B', 'C', 'D', 'E']
+
+const isAdminUser = (userId) => ADMIN_USER_IDS.has(userId)
+
+const createDraftId = () => (
+  window.crypto?.randomUUID?.() ?? `draft-${Date.now()}-${Math.random().toString(16).slice(2)}`
+)
+
+const createEmptyQuestion = (position = 0) => ({
+  id: createDraftId(),
+  prompt: '',
+  imageUrl: '',
+  options: Object.fromEntries(ANSWER_OPTIONS.map((option) => [option, ''])),
+  correctOption: 'A',
+  position,
+})
+
+const createEmptySimulationDraft = () => ({
+  id: null,
+  title: '',
+  description: '',
+  imageUrl: '',
+  scoreMax: 20,
+  isPublished: true,
+  questions: [createEmptyQuestion()],
+})
+
+const normalizeSimulationRow = (row) => ({
+  id: row.id,
+  title: row.title,
+  description: row.description ?? '',
+  imageUrl: row.image_url ?? '',
+  scoreMax: Number(row.score_max ?? 20),
+  isPublished: row.is_published ?? true,
+  createdBy: row.created_by,
+  createdAt: row.created_at,
+  questions: (row.simulation_questions ?? [])
+    .map((question) => ({
+      id: question.id,
+      prompt: question.prompt,
+      imageUrl: question.image_url ?? '',
+      correctOption: question.correct_option ?? 'A',
+      position: question.position ?? 0,
+      options: {
+        A: question.option_a ?? '',
+        B: question.option_b ?? '',
+        C: question.option_c ?? '',
+        D: question.option_d ?? '',
+        E: question.option_e ?? '',
+      },
+    }))
+    .sort((a, b) => a.position - b.position),
+})
+
+const simulationToDraft = (simulation) => ({
+  id: simulation.id,
+  title: simulation.title,
+  description: simulation.description,
+  imageUrl: simulation.imageUrl,
+  scoreMax: simulation.scoreMax,
+  isPublished: simulation.isPublished,
+  questions: simulation.questions.length
+    ? simulation.questions.map((question, index) => ({ ...question, position: index }))
+    : [createEmptyQuestion()],
+})
+
+const calculateSimulationResult = (simulation, answers) => {
+  const questionCount = simulation.questions.length
+  const correctCount = simulation.questions.filter((question) => answers[question.id] === question.correctOption).length
+  const score = questionCount ? Number(((correctCount / questionCount) * simulation.scoreMax).toFixed(2)) : 0
+
+  return { correctCount, questionCount, score }
+}
+
+const normalizeSimulationAttempt = (row) => ({
+  id: row.id,
+  simulationId: row.simulation_id,
+  score: Number(row.score ?? 0),
+  correctCount: row.correct_count ?? 0,
+  questionCount: row.question_count ?? 0,
+  completedAt: row.completed_at,
+})
+
+const normalizeSimulationRankingRow = (row) => ({
+  simulationId: row.simulation_id,
+  userId: row.user_id,
+  displayName: row.display_name ?? 'Estudiante',
+  bestScore: Number(row.best_score ?? 0),
+  bestCorrectCount: row.best_correct_count ?? 0,
+  questionCount: row.question_count ?? 0,
+  attemptCount: row.attempt_count ?? 0,
+  lastCompletedAt: row.last_completed_at,
+})
 
 const PUBLIC_NAV_LINKS = [
   { href: '/acerca-de', label: 'Acerca de' },
@@ -360,6 +473,18 @@ function App() {
   const [leaderboardLoading, setLeaderboardLoading] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [editExamForm, setEditExamForm] = useState({ name: '', targetDate: '' })
+  const [simulations, setSimulations] = useState([])
+  const [simulationsLoading, setSimulationsLoading] = useState(false)
+  const [simulationsError, setSimulationsError] = useState('')
+  const [activeSimulationId, setActiveSimulationId] = useState(null)
+  const [simulationDraft, setSimulationDraft] = useState(createEmptySimulationDraft)
+  const [simulationAnswers, setSimulationAnswers] = useState({})
+  const [simulationResults, setSimulationResults] = useState({})
+  const [simulationAttempts, setSimulationAttempts] = useState([])
+  const [simulationRankings, setSimulationRankings] = useState([])
+  const [simulationRankingLoading, setSimulationRankingLoading] = useState(false)
+  const [simulationRankingError, setSimulationRankingError] = useState('')
+  const [activeRankingSimulationId, setActiveRankingSimulationId] = useState(null)
 
   const showToast = useCallback((message, type = 'success') => {
     setToast({ message, type })
@@ -461,7 +586,7 @@ function App() {
             id: topic.id,
             name: topic.name,
             done: topic.done,
-            status: topic.status ?? (topic.done ? 'completado' : 'pendiente'),
+            status: normalizeStatus(topic.status ?? (topic.done ? 'completado' : 'pendiente')),
             position: topic.position,
             completedAt: topic.completed_at,
           })
@@ -523,6 +648,105 @@ function App() {
     } finally {
       setLeaderboardLoading(false)
     }
+  }, [session])
+
+  const fetchSimulations = useCallback(async () => {
+    if (!session?.user?.id || !supabase) return
+
+    setSimulationsLoading(true)
+    setSimulationsError('')
+    try {
+      const { data, error } = await supabase
+        .from('simulations')
+        .select(`
+          id,
+          title,
+          description,
+          image_url,
+          score_max,
+          is_published,
+          created_by,
+          created_at,
+          simulation_questions (
+            id,
+            prompt,
+            image_url,
+            option_a,
+            option_b,
+            option_c,
+            option_d,
+            option_e,
+            correct_option,
+            position
+          )
+        `)
+        .order('created_at', { ascending: false })
+
+      if (error) throw error
+
+      const mappedSimulations = (data ?? []).map(normalizeSimulationRow)
+      setSimulations(mappedSimulations)
+      setActiveSimulationId((current) => (
+        current && mappedSimulations.some((simulation) => simulation.id === current)
+          ? current
+          : mappedSimulations[0]?.id ?? null
+      ))
+      setActiveRankingSimulationId((current) => {
+        const publishedSimulations = mappedSimulations.filter((simulation) => simulation.isPublished)
+        if (current && publishedSimulations.some((simulation) => simulation.id === current)) return current
+        return publishedSimulations[0]?.id ?? null
+      })
+    } catch (error) {
+      setSimulations([])
+      setSimulationsError(
+        isMissingColumnError(error) || /relation|simulation/i.test(error?.message ?? '')
+          ? 'Aun falta crear las tablas de simulacros en Supabase. Ejecuta el SQL incluido en supabase/simulations.sql.'
+          : normalizeError(error),
+      )
+    } finally {
+      setSimulationsLoading(false)
+    }
+  }, [session?.user?.id])
+
+  const fetchSimulationAttempts = useCallback(async () => {
+    const currentUserId = session?.user?.id
+    if (!currentUserId || !supabase) return
+
+    try {
+      const { data, error } = await supabase
+        .from('simulation_attempts')
+        .select('id, simulation_id, correct_count, question_count, score, completed_at')
+        .eq('user_id', currentUserId)
+        .order('completed_at', { ascending: false })
+
+      if (error) throw error
+      setSimulationAttempts((data ?? []).map(normalizeSimulationAttempt))
+    } catch {
+      setSimulationAttempts([])
+    }
+  }, [session?.user?.id])
+
+  const fetchSimulationRankings = useCallback(async () => {
+    if (!session?.user?.id || !supabase) return
+
+    setSimulationRankingLoading(true)
+    setSimulationRankingError('')
+    try {
+      const { data, error } = await supabase.rpc('get_simulation_rankings')
+      if (error) throw error
+
+      const mappedRankings = (data ?? []).map(normalizeSimulationRankingRow)
+      setSimulationRankings(mappedRankings)
+    } catch (error) {
+      setSimulationRankings([])
+      setSimulationRankingError(
+        /get_simulation_rankings|function|schema cache/i.test(error?.message ?? '')
+          ? 'Aun falta ejecutar la funcion get_simulation_rankings incluida en supabase/simulations.sql.'
+          : normalizeError(error),
+      )
+    } finally {
+      setSimulationRankingLoading(false)
+    }
   }, [session?.user?.id])
 
   useEffect(() => {
@@ -571,6 +795,19 @@ function App() {
     }
   }, [fetchLeaderboard, session?.user?.id])
 
+  useEffect(() => {
+    if (session?.user?.id) {
+      Promise.resolve().then(() => fetchSimulations())
+    }
+  }, [fetchSimulations, session?.user?.id])
+
+  useEffect(() => {
+    if (session?.user?.id) {
+      Promise.resolve().then(() => fetchSimulationAttempts())
+      Promise.resolve().then(() => fetchSimulationRankings())
+    }
+  }, [fetchSimulationAttempts, fetchSimulationRankings, session?.user?.id])
+
   const activeExam = useMemo(
     () => exams.find((exam) => exam.id === activeExamId) ?? exams[0] ?? null,
     [activeExamId, exams],
@@ -584,6 +821,7 @@ function App() {
   const leaderboardEntries = buildLeaderboard(leaderboard, userStats, displayName, session?.user?.id)
   const publicPath = getPublicPath()
   const hasExistingTemplate = (template) => exams.some((exam) => isTemplatePreparation(exam, template))
+  const isAdmin = isAdminUser(session?.user?.id)
 
   if (publicPath) {
     return <PublicRoute path={publicPath} isLoggedIn={Boolean(session)} />
@@ -817,6 +1055,146 @@ function App() {
     })
   }
 
+  const removeTopic = (courseId, topicId) => {
+    if (!activeExam || !session?.user?.id || !supabase) return
+
+    const course = activeExam.courses.find((item) => item.id === courseId)
+    const topic = course?.topics.find((item) => item.id === topicId)
+    if (!topic) return
+
+    const hasProgress = isCompletedTopic(topic) || getTopicStatus(topic) !== 'pendiente' || Boolean(topic.completedAt)
+    const message = hasProgress
+      ? 'Este tema tiene progreso registrado. Si lo eliminas, se perdera este avance.'
+      : 'Deseas eliminar este tema?'
+
+    if (!window.confirm(message)) return
+
+    runAction(`delete-topic-${topicId}`, async () => {
+      const { error } = await supabase
+        .from('topics')
+        .delete()
+        .eq('id', topicId)
+        .eq('user_id', session.user.id)
+
+      if (error) throw error
+
+      setExams((currentExams) => currentExams.map((exam) => (
+        exam.id !== activeExam.id
+          ? exam
+          : {
+            ...exam,
+            courses: exam.courses.map((item) => (
+              item.id !== courseId
+                ? item
+                : { ...item, topics: item.topics.filter((currentTopic) => currentTopic.id !== topicId) }
+            )),
+          }
+      )))
+      if (hasProgress) await fetchLeaderboard()
+      showToast('Tema eliminado.', 'info')
+    })
+  }
+
+  const insertImportedTopics = async (rows) => {
+    if (!rows.length) return
+
+    let response = await supabase.from('topics').insert(rows)
+
+    if (response.error && isMissingColumnError(response.error)) {
+      response = await supabase.from('topics').insert(rows.map((row) => ({
+        user_id: row.user_id,
+        course_id: row.course_id,
+        name: row.name,
+        status: row.status,
+        done: row.done,
+        completed_at: row.completed_at,
+        position: row.position,
+      })))
+    }
+
+    if (response.error && isMissingColumnError(response.error)) {
+      response = await supabase.from('topics').insert(rows.map((row) => ({
+        user_id: row.user_id,
+        course_id: row.course_id,
+        name: row.name,
+        done: row.done,
+        completed_at: row.completed_at,
+        position: row.position,
+      })))
+    }
+
+    if (response.error) throw response.error
+  }
+
+  const handleImportTopics = async ({ rows, createMissingCourses, skipDuplicates }) => {
+    if (!activeExam || !session?.user?.id || !supabase) return undefined
+
+    let result
+    await runAction('import-topics', async () => {
+      const validRows = rows.filter((row) => !row.errors.length && !(skipDuplicates && row.duplicate))
+      if (!validRows.length) {
+        throw new Error('No hay filas validas para importar.')
+      }
+
+      const coursesByName = new Map(activeExam.courses.map((course) => [normalizeLookupKey(course.name), course]))
+      const missingCourseNames = [...new Set(
+        validRows
+          .filter((row) => !coursesByName.has(normalizeLookupKey(row.courseName)))
+          .map((row) => row.courseName),
+      )]
+
+      if (missingCourseNames.length && !createMissingCourses) {
+        throw new Error('Hay cursos que no existen. Activa la creacion automatica o corrige el CSV.')
+      }
+
+      if (missingCourseNames.length) {
+        const courseRows = missingCourseNames.map((name, index) => ({
+          user_id: session.user.id,
+          exam_id: activeExam.id,
+          name,
+          position: activeExam.courses.length + index,
+        }))
+        const { data, error } = await supabase
+          .from('courses')
+          .insert(courseRows)
+          .select('id, name, position')
+
+        if (error) throw error
+        ;(data ?? []).forEach((course) => coursesByName.set(normalizeLookupKey(course.name), { ...course, topics: [] }))
+      }
+
+      const topicPositions = new Map(activeExam.courses.map((course) => [course.id, course.topics.length]))
+      const topicRows = validRows.map((row) => {
+        const course = coursesByName.get(normalizeLookupKey(row.courseName))
+        const currentPosition = topicPositions.get(course.id) ?? 0
+        topicPositions.set(course.id, currentPosition + 1)
+        const status = normalizeStatus(row.status)
+        const done = status === 'completado'
+
+        return {
+          user_id: session.user.id,
+          course_id: course.id,
+          name: row.topicName,
+          status,
+          importance: row.importance,
+          notes: row.notes || null,
+          done,
+          completed_at: done ? new Date().toISOString() : null,
+          position: currentPosition,
+        }
+      })
+
+      await insertImportedTopics(topicRows)
+      await fetchWorkspace()
+
+      const skipped = rows.filter((row) => row.errors.length || (skipDuplicates && row.duplicate)).length
+      result = { imported: topicRows.length, skipped }
+      showToast(`Se importaron ${result.imported} temas correctamente. ${result.skipped} filas fueron omitidas.`, 'success')
+    })
+
+    return result
+  }
+
   const removeCourse = (courseId) => {
     if (!supabase) return
 
@@ -874,6 +1252,149 @@ function App() {
       setView('home')
       await fetchWorkspace()
       showToast('Examen eliminado.', 'info')
+    })
+  }
+
+  const startNewSimulation = () => {
+    setSimulationDraft(createEmptySimulationDraft())
+  }
+
+  const editSimulation = (simulation) => {
+    setSimulationDraft(simulationToDraft(simulation))
+    setActiveSimulationId(simulation.id)
+  }
+
+  const saveSimulation = (event) => {
+    event.preventDefault()
+    if (!isAdmin || !session?.user?.id || !supabase) return
+
+    const title = simulationDraft.title.trim()
+    const description = simulationDraft.description.trim()
+    const validQuestions = simulationDraft.questions.map((question, index) => ({
+      ...question,
+      prompt: question.prompt.trim(),
+      imageUrl: question.imageUrl.trim(),
+      options: Object.fromEntries(ANSWER_OPTIONS.map((option) => [option, question.options[option].trim()])),
+      position: index,
+    }))
+
+    if (!title) {
+      showToast('Escribe el nombre del simulacro.', 'error')
+      return
+    }
+
+    if (!validQuestions.length || validQuestions.some((question) => !question.prompt || ANSWER_OPTIONS.some((option) => !question.options[option]))) {
+      showToast('Completa el texto y las alternativas A, B, C, D y E de cada pregunta.', 'error')
+      return
+    }
+
+    runAction('save-simulation', async () => {
+      const simulationPayload = {
+        title,
+        description,
+        image_url: simulationDraft.imageUrl.trim() || null,
+        score_max: Number(simulationDraft.scoreMax) || 20,
+        is_published: simulationDraft.isPublished,
+      }
+
+      let simulationId = simulationDraft.id
+
+      if (simulationId) {
+        const { error } = await supabase
+          .from('simulations')
+          .update(simulationPayload)
+          .eq('id', simulationId)
+        if (error) throw error
+
+        const { error: deleteQuestionsError } = await supabase
+          .from('simulation_questions')
+          .delete()
+          .eq('simulation_id', simulationId)
+        if (deleteQuestionsError) throw deleteQuestionsError
+      } else {
+        const { data, error } = await supabase
+          .from('simulations')
+          .insert({ ...simulationPayload, created_by: session.user.id })
+          .select('id')
+          .single()
+        if (error) throw error
+        simulationId = data.id
+      }
+
+      const questionRows = validQuestions.map((question) => ({
+        simulation_id: simulationId,
+        prompt: question.prompt,
+        image_url: question.imageUrl || null,
+        option_a: question.options.A,
+        option_b: question.options.B,
+        option_c: question.options.C,
+        option_d: question.options.D,
+        option_e: question.options.E,
+        correct_option: question.correctOption,
+        position: question.position,
+      }))
+
+      const { error: questionsError } = await supabase.from('simulation_questions').insert(questionRows)
+      if (questionsError) throw questionsError
+
+      await fetchSimulations()
+      await fetchSimulationRankings()
+      setActiveSimulationId(simulationId)
+      setSimulationDraft(createEmptySimulationDraft())
+      showToast('Simulacro guardado.')
+    })
+  }
+
+  const deleteSimulation = (simulationId) => {
+    if (!isAdmin || !supabase) return
+    if (!window.confirm('Eliminar este simulacro tambien quitara sus preguntas e intentos registrados.')) return
+
+    runAction(`delete-simulation-${simulationId}`, async () => {
+      const { error } = await supabase.from('simulations').delete().eq('id', simulationId)
+      if (error) throw error
+      await fetchSimulations()
+      await fetchSimulationRankings()
+      setSimulationDraft(createEmptySimulationDraft())
+      showToast('Simulacro eliminado.', 'info')
+    })
+  }
+
+  const setSimulationAnswer = (simulationId, questionId, answer) => {
+    setSimulationAnswers((current) => ({
+      ...current,
+      [simulationId]: {
+        ...(current[simulationId] ?? {}),
+        [questionId]: answer,
+      },
+    }))
+  }
+
+  const submitSimulationAttempt = (simulation) => {
+    if (!session?.user?.id || !supabase) return
+    const answers = simulationAnswers[simulation.id] ?? {}
+
+    if (simulation.questions.some((question) => !answers[question.id])) {
+      showToast('Responde todas las preguntas antes de terminar.', 'error')
+      return
+    }
+
+    const result = calculateSimulationResult(simulation, answers)
+    setSimulationResults((current) => ({ ...current, [simulation.id]: result }))
+
+    runAction(`submit-simulation-${simulation.id}`, async () => {
+      const { error } = await supabase.from('simulation_attempts').insert({
+        simulation_id: simulation.id,
+        user_id: session.user.id,
+        answers,
+        correct_count: result.correctCount,
+        question_count: result.questionCount,
+        score: result.score,
+      })
+
+      if (error) throw error
+      await fetchSimulationAttempts()
+      await fetchSimulationRankings()
+      showToast(`Nota calculada: ${result.score}/${simulation.scoreMax}.`, 'success')
     })
   }
 
@@ -1006,13 +1527,42 @@ function App() {
           onAddCourse={handleAddCourse}
           onAddTopic={handleAddTopic}
           onSetTopicStatus={updateTopicStatus}
+          onRemoveTopic={removeTopic}
           onRemoveCourse={removeCourse}
+          onImportTopics={handleImportTopics}
           actionLoading={actionLoading}
         />
       ) : view === 'weekly-sim' ? (
-        <WeeklySimulationPage exam={activeExam} />
+        <WeeklySimulationPage
+          simulations={simulations}
+          loading={simulationsLoading}
+          error={simulationsError}
+          isAdmin={isAdmin}
+          activeSimulationId={activeSimulationId}
+          setActiveSimulationId={setActiveSimulationId}
+          draft={simulationDraft}
+          setDraft={setSimulationDraft}
+          answers={simulationAnswers}
+          results={simulationResults}
+          attempts={simulationAttempts}
+          onNewSimulation={startNewSimulation}
+          onEditSimulation={editSimulation}
+          onSaveSimulation={saveSimulation}
+          onDeleteSimulation={deleteSimulation}
+          onSetAnswer={setSimulationAnswer}
+          onSubmitAttempt={submitSimulationAttempt}
+          actionLoading={actionLoading}
+        />
       ) : view === 'weekly-ranking' ? (
-        <WeeklySimulationRankingPage exam={activeExam} />
+        <WeeklySimulationRankingPage
+          simulations={simulations}
+          rankings={simulationRankings}
+          loading={simulationRankingLoading || simulationsLoading}
+          error={simulationRankingError || simulationsError}
+          activeSimulationId={activeRankingSimulationId}
+          setActiveSimulationId={setActiveRankingSimulationId}
+          currentUserId={session.user.id}
+        />
       ) : view === 'global' ? (
         <GlobalPage
           entries={leaderboardEntries}
@@ -1557,6 +2107,7 @@ function AppFooter() {
       <section className="footer-brand">
         <BrandLockup small />
         <p>Organiza tu estudio, mide tu avance y manten tu progreso.</p>
+        <p className="footer-credit">Con mencion honorifica a Abel Marcial Palomino Espinoza por sus ideas, pruebas y feedback en la mejora de Trackedux.</p>
         <a href={`mailto:${CONTACT_LINKS.primaryEmail}`}>{CONTACT_LINKS.primaryEmail}</a>
       </section>
       <FooterColumn
@@ -1603,7 +2154,7 @@ function FooterColumn({ title, links }) {
 
 function HomePage({ exam, stats, userStats, daysLeft, weeksLeft, onOpenCourses }) {
   const examTemplate = getTemplateForExam(exam)
-  const templateNotice = examTemplate ? (exam.sourceNote ?? examTemplate.sourceNote) : null
+  const templateNotice = getTemplateNotice(exam, examTemplate)
 
   return (
     <main className="dashboard reveal">
@@ -1672,7 +2223,10 @@ function HomePage({ exam, stats, userStats, daysLeft, weeksLeft, onOpenCourses }
                     <h3>{course.name}</h3>
                     <p>{courseStats.learned} de {courseStats.total} temas aprendidos</p>
                   </div>
-                  <UrgencyBadge urgency={urgency} />
+                  <div className="course-card-badges">
+                    <StatusBadge status={getCourseStatus(course)} />
+                    <UrgencyBadge urgency={urgency} />
+                  </div>
                 </div>
                 <MiniProgress percent={courseStats.percent} />
               </article>
@@ -1818,13 +2372,16 @@ function CoursesPage({
   onAddCourse,
   onAddTopic,
   onSetTopicStatus,
+  onRemoveTopic,
   onRemoveCourse,
+  onImportTopics,
   actionLoading,
 }) {
   const [selectedCourseId, setSelectedCourseId] = useState(exam.courses[0]?.id ?? null)
   const [courseQuery, setCourseQuery] = useState('')
   const [topicQuery, setTopicQuery] = useState('')
   const [collapsedTopicGroups, setCollapsedTopicGroups] = useState({})
+  const [importOpen, setImportOpen] = useState(false)
 
   const activeCourse = exam.courses.find((course) => course.id === selectedCourseId) ?? exam.courses[0] ?? null
   const filteredCourses = useMemo(() => {
@@ -1868,6 +2425,10 @@ function CoursesPage({
           <p className="eyebrow">Cursos de {exam.name}</p>
           <h1>Gestiona tu temario</h1>
         </div>
+        <button className="secondary-btn import-topics-trigger" type="button" onClick={() => setImportOpen(true)}>
+          <Upload size={18} />
+          Importar temas
+        </button>
         <form className="inline-form course-create-form" onSubmit={onAddCourse}>
           <input
             value={courseName}
@@ -1909,6 +2470,7 @@ function CoursesPage({
                   >
                     <span>{course.name}</span>
                     <small>{stats.learned}/{stats.total} temas</small>
+                    <StatusBadge status={getCourseStatus(course)} className="course-list-status" />
                     <MiniProgress percent={stats.percent} />
                   </button>
                 )
@@ -1944,6 +2506,7 @@ function CoursesPage({
                   <strong>{activeStats.percent}%</strong>
                   <span>avance del curso</span>
                 </div>
+                <StatusBadge status={getCourseStatus(activeCourse)} />
               </div>
 
               <div className="topic-toolbar">
@@ -2003,24 +2566,37 @@ function CoursesPage({
                             <div className="topic-list comfortable" id={panelId}>
                               {group.topics.map((topic) => (
                                 <div className={isCompletedTopic(topic) ? 'topic done' : 'topic'} key={topic.id}>
-                                  <span className="topic-state-dot" data-status={getTopicStatus(topic)} />
-                                  <div className="topic-main">
-                                    <span>{topic.name}</span>
-                                    <div className="topic-status-controls" aria-label={`Estado de ${topic.name}`}>
-                                      {TOPIC_STATUS_OPTIONS.map((status) => (
-                                        <button
-                                          type="button"
-                                          className={getTopicStatus(topic) === status.value ? 'active' : ''}
-                                          onClick={() => onSetTopicStatus(activeCourse.id, topic.id, status.value)}
-                                          disabled={actionLoading === `toggle-${topic.id}`}
-                                          key={status.value}
-                                        >
-                                          {status.label}
-                                        </button>
-                                      ))}
+                                  <div className="topic-head">
+                                    <span className="topic-state-dot" data-status={getTopicStatus(topic)} />
+                                    <span className="topic-name">{topic.name}</span>
+                                    <StatusBadge status={getTopicStatus(topic)} className="topic-current-status" />
+                                    <div className="topic-actions">
+                                      {actionLoading === `toggle-${topic.id}` && <LoaderCircle className="inline-spinner" size={16} />}
+                                      <button
+                                        className="icon-btn topic-delete-btn"
+                                        type="button"
+                                        aria-label={`Eliminar tema ${topic.name}`}
+                                        onClick={() => onRemoveTopic(activeCourse.id, topic.id)}
+                                        disabled={actionLoading === `delete-topic-${topic.id}`}
+                                      >
+                                        {actionLoading === `delete-topic-${topic.id}` ? <LoaderCircle size={16} /> : <Trash2 size={16} />}
+                                      </button>
                                     </div>
                                   </div>
-                                  {actionLoading === `toggle-${topic.id}` && <LoaderCircle className="inline-spinner" size={16} />}
+                                  <div className="topic-status-controls" aria-label={`Estado de ${topic.name}`}>
+                                    {TOPIC_STATUS_OPTIONS.map((status) => (
+                                      <button
+                                        type="button"
+                                        className={getTopicStatus(topic) === status.value ? 'active' : ''}
+                                        data-status={status.value}
+                                        onClick={() => onSetTopicStatus(activeCourse.id, topic.id, status.value)}
+                                        disabled={actionLoading === `toggle-${topic.id}`}
+                                        key={status.value}
+                                      >
+                                        {status.label}
+                                      </button>
+                                    ))}
+                                  </div>
                                 </div>
                               ))}
                             </div>
@@ -2047,46 +2623,554 @@ function CoursesPage({
           <p>Empieza con el primer curso de tu examen y luego agrega sus temas.</p>
         </div>
       )}
+
+      {importOpen && (
+        <ImportTopicsModal
+          exam={exam}
+          onClose={() => setImportOpen(false)}
+          onImportTopics={onImportTopics}
+          loading={actionLoading === 'import-topics'}
+        />
+      )}
     </main>
   )
 }
 
-function WeeklySimulationPage({ exam }) {
-  const template = getTemplateForExam(exam)
+function ImportTopicsModal({ exam, onClose, onImportTopics, loading }) {
+  const [csvRows, setCsvRows] = useState([])
+  const [fileName, setFileName] = useState('')
+  const [fileError, setFileError] = useState('')
+  const [createMissingCourses, setCreateMissingCourses] = useState(true)
+  const [skipDuplicates, setSkipDuplicates] = useState(true)
+
+  const previewRows = useMemo(() => (
+    validateImportedTopicRows(csvRows, exam.courses, { createMissingCourses, skipDuplicates })
+  ), [createMissingCourses, csvRows, exam.courses, skipDuplicates])
+
+  const errorCount = previewRows.filter((row) => row.errors.length).length
+  const skippedCount = previewRows.filter((row) => row.skipped || row.errors.length).length
+  const importableCount = previewRows.filter((row) => !row.errors.length && !row.skipped).length
+
+  const downloadTemplate = () => {
+    const blob = new Blob([TOPICS_CSV_TEMPLATE], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'trackedux_plantilla_temas.csv'
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const handleFileChange = (event) => {
+    const file = event.target.files?.[0]
+    setFileError('')
+    setCsvRows([])
+    setFileName(file?.name ?? '')
+
+    if (!file) return
+    if (!file.name.toLowerCase().endsWith('.csv')) {
+      setFileError('Por ahora la importacion acepta archivos CSV. Puedes convertir tu Excel a CSV y volver a intentarlo.')
+      return
+    }
+
+    const reader = new FileReader()
+    reader.onload = () => {
+      try {
+        const parsedRows = parseCsvTopics(reader.result)
+        if (!parsedRows.length) {
+          setFileError('El CSV no tiene filas para importar.')
+          return
+        }
+        setCsvRows(parsedRows)
+      } catch {
+        setFileError('No se pudo leer el CSV. Revisa el formato de columnas.')
+      }
+    }
+    reader.onerror = () => setFileError('No se pudo leer el archivo seleccionado.')
+    reader.readAsText(file)
+  }
+
+  const handleConfirm = async () => {
+    const result = await onImportTopics({ rows: previewRows, createMissingCourses, skipDuplicates })
+    if (result) onClose()
+  }
 
   return (
-    <main className="dashboard beta-page reveal">
-      <section className="beta-hero">
-        <div>
-          <p className="eyebrow">Beta / proximamente</p>
-          <h1>Simulacro semanal</h1>
-          <p>
-            Un espacio para programar simulacros por universidad, curso o tema, y comparar cada intento con tu avance real.
-          </p>
+    <div className="modal-backdrop" role="presentation">
+      <section className="settings-modal import-modal" role="dialog" aria-modal="true" aria-labelledby="import-topics-title">
+        <button className="icon-btn close-btn" aria-label="Cerrar" onClick={onClose} disabled={loading}>
+          <X size={18} />
+        </button>
+        <p className="eyebrow">Carga masiva</p>
+        <h2 id="import-topics-title">Importar temas desde CSV</h2>
+        <p className="muted">
+          Usa las columnas curso, tema, subtema, importancia, estado y notas. Revisa la vista previa antes de guardar.
+        </p>
+
+        <div className="import-actions">
+          <button className="secondary-btn" type="button" onClick={downloadTemplate}>
+            <FileDown size={18} />
+            Descargar plantilla CSV
+          </button>
+          <label className="file-picker">
+            <Upload size={18} />
+            <span>{fileName || 'Subir archivo CSV'}</span>
+            <input type="file" accept=".csv,text/csv" onChange={handleFileChange} disabled={loading} />
+          </label>
         </div>
-        <span className="beta-badge">Próximamente</span>
+
+        <div className="import-options">
+          <label>
+            <input
+              type="checkbox"
+              checked={createMissingCourses}
+              onChange={(event) => setCreateMissingCourses(event.target.checked)}
+            />
+            Crear cursos faltantes automaticamente
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={skipDuplicates}
+              onChange={(event) => setSkipDuplicates(event.target.checked)}
+            />
+            Saltar duplicados recomendados
+          </label>
+        </div>
+
+        {fileError && <div className="template-warning">{fileError}</div>}
+
+        {previewRows.length > 0 && (
+          <>
+            <div className="import-summary">
+              <span>{importableCount} temas listos</span>
+              <span>{skippedCount} filas omitidas</span>
+              <span>{errorCount} con errores</span>
+            </div>
+            <div className="import-preview" role="region" aria-label="Vista previa de temas importados">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Fila</th>
+                    <th>Curso</th>
+                    <th>Tema</th>
+                    <th>Estado</th>
+                    <th>Resultado</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {previewRows.slice(0, 12).map((row) => (
+                    <tr className={row.errors.length ? 'has-error' : row.skipped ? 'is-skipped' : ''} key={row.rowNumber}>
+                      <td>{row.rowNumber}</td>
+                      <td>{row.courseName || '-'}</td>
+                      <td>{row.topicName || '-'}</td>
+                      <td><StatusBadge status={row.status} /></td>
+                      <td>{row.errors[0] ?? row.warnings[0] ?? 'Lista para importar'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {previewRows.length > 12 && <p className="muted">Mostrando 12 de {previewRows.length} filas.</p>}
+            </div>
+          </>
+        )}
+
+        <div className="modal-actions import-modal-actions">
+          <button className="ghost-btn" type="button" onClick={onClose} disabled={loading}>
+            Cancelar
+          </button>
+          <Button className="primary-btn" type="button" onClick={handleConfirm} loading={loading} disabled={!importableCount}>
+            <Upload size={18} />
+            Confirmar importacion
+          </Button>
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function WeeklySimulationPage({
+  simulations,
+  loading,
+  error,
+  isAdmin,
+  activeSimulationId,
+  setActiveSimulationId,
+  draft,
+  setDraft,
+  answers,
+  results,
+  attempts,
+  onNewSimulation,
+  onEditSimulation,
+  onSaveSimulation,
+  onDeleteSimulation,
+  onSetAnswer,
+  onSubmitAttempt,
+  actionLoading,
+}) {
+  const [mode, setMode] = useState('student')
+  const visibleSimulations = simulations.filter((simulation) => simulation.isPublished)
+  const managedSimulations = simulations
+  const activeSimulation = visibleSimulations.find((simulation) => simulation.id === activeSimulationId) ?? visibleSimulations[0] ?? null
+  const activeAnswers = activeSimulation ? (answers[activeSimulation.id] ?? {}) : {}
+  const activeResult = activeSimulation ? results[activeSimulation.id] : null
+  const activeAttempts = activeSimulation ? attempts.filter((attempt) => attempt.simulationId === activeSimulation.id) : []
+  const selectedCount = Object.keys(activeAnswers).length
+
+  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }))
+  const updateQuestion = (index, patch) => {
+    setDraft((current) => ({
+      ...current,
+      questions: current.questions.map((question, questionIndex) => (
+        questionIndex === index ? { ...question, ...patch } : question
+      )),
+    }))
+  }
+  const updateQuestionOption = (index, option, value) => {
+    setDraft((current) => ({
+      ...current,
+      questions: current.questions.map((question, questionIndex) => (
+        questionIndex === index
+          ? { ...question, options: { ...question.options, [option]: value } }
+          : question
+      )),
+    }))
+  }
+  const addQuestion = () => {
+    setDraft((current) => ({
+      ...current,
+      questions: [...current.questions, createEmptyQuestion(current.questions.length)],
+    }))
+  }
+  const removeQuestion = (index) => {
+    setDraft((current) => ({
+      ...current,
+      questions: current.questions.length > 1
+        ? current.questions.filter((_, questionIndex) => questionIndex !== index)
+        : current.questions,
+    }))
+  }
+
+  return (
+    <main className="dashboard simulation-page reveal">
+      <section className="simulation-hero">
+        <div>
+          <p className="eyebrow">Simulacros generales</p>
+          <h1>Simulacros</h1>
+          <p>Practicas publicadas para todos los usuarios, con nota inmediata y ranking global por simulacro.</p>
+        </div>
+        {isAdmin && <span className="admin-badge">Admin activo</span>}
       </section>
 
-      <section className="beta-grid">
-        <article className="beta-card highlight">
-          <span className="beta-icon"><FileText size={22} /></span>
+      {error && <div className="template-warning">{error}</div>}
+
+      {isAdmin && (
+        <div className="simulation-mode-switch" role="tablist" aria-label="Modo de simulacros">
+          <button className={mode === 'student' ? 'active' : ''} type="button" onClick={() => setMode('student')}>
+            <BookOpen size={17} />
+            Vista estudiantes
+          </button>
+          <button className={mode === 'admin' ? 'active' : ''} type="button" onClick={() => setMode('admin')}>
+            <Settings size={17} />
+            Panel admin
+          </button>
+        </div>
+      )}
+
+      {isAdmin && mode === 'admin' ? (
+        <section className="simulation-admin-panel">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Crear y editar</p>
+              <h2>{draft.id ? 'Editar simulacro' : 'Nuevo simulacro'}</h2>
+            </div>
+            <button className="secondary-btn" type="button" onClick={onNewSimulation}>
+              <Plus size={18} />
+              Nuevo
+            </button>
+          </div>
+
+          <form className="simulation-editor" onSubmit={onSaveSimulation}>
+            <div className="simulation-editor-grid">
+              <label>
+                Nombre del simulacro
+                <input value={draft.title} onChange={(event) => updateDraft('title', event.target.value)} placeholder="Ej. Simulacro UNI 01" />
+              </label>
+              <label>
+                Puntaje maximo
+                <input
+                  type="number"
+                  min="1"
+                  max="20"
+                  step="0.25"
+                  value={draft.scoreMax}
+                  onChange={(event) => updateDraft('scoreMax', event.target.value)}
+                />
+              </label>
+              <label className="simulation-publish-toggle">
+                <input
+                  type="checkbox"
+                  checked={draft.isPublished}
+                  onChange={(event) => updateDraft('isPublished', event.target.checked)}
+                />
+                Publicado para estudiantes
+              </label>
+            </div>
+
+            <label>
+              Descripcion
+              <textarea
+                value={draft.description}
+                onChange={(event) => updateDraft('description', event.target.value)}
+                placeholder="Describe alcance, reglas o duracion sugerida."
+              />
+            </label>
+
+            <ImageInput label="Imagen del simulacro" value={draft.imageUrl} onChange={(value) => updateDraft('imageUrl', value)} />
+
+            <div className="question-editor-list">
+              {draft.questions.map((question, index) => (
+                <article className="question-editor" key={question.id}>
+                  <div className="question-editor-head">
+                    <span>Pregunta {index + 1}</span>
+                    <button className="icon-btn" type="button" aria-label="Eliminar pregunta" onClick={() => removeQuestion(index)}>
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+
+                  <label>
+                    Texto de la pregunta
+                    <textarea
+                      value={question.prompt}
+                      onChange={(event) => updateQuestion(index, { prompt: event.target.value })}
+                      placeholder="Escribe el enunciado."
+                    />
+                  </label>
+
+                  <ImageInput label="Imagen de la pregunta" value={question.imageUrl} onChange={(value) => updateQuestion(index, { imageUrl: value })} />
+
+                  <div className="answer-grid">
+                    {ANSWER_OPTIONS.map((option) => (
+                      <label key={option}>
+                        Alternativa {option}
+                        <input
+                          value={question.options[option]}
+                          onChange={(event) => updateQuestionOption(index, option, event.target.value)}
+                          placeholder={`Respuesta ${option}`}
+                        />
+                      </label>
+                    ))}
+                    <label>
+                      Clave correcta
+                      <select value={question.correctOption} onChange={(event) => updateQuestion(index, { correctOption: event.target.value })}>
+                        {ANSWER_OPTIONS.map((option) => <option value={option} key={option}>{option}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                </article>
+              ))}
+            </div>
+
+            <div className="simulation-form-actions">
+              <button className="secondary-btn" type="button" onClick={addQuestion}>
+                <Plus size={18} />
+                Anadir pregunta
+              </button>
+              <Button className="primary-btn" type="submit" loading={actionLoading === 'save-simulation'}>
+                <Check size={18} />
+                Guardar simulacro
+              </Button>
+            </div>
+          </form>
+
+          <section className="admin-simulation-manager">
+            <div>
+              <p className="eyebrow">Publicados y borradores</p>
+              <h2>Simulacros creados</h2>
+            </div>
+            <div className="admin-simulation-list">
+              {managedSimulations.map((simulation) => (
+                <article className="admin-simulation-item" key={simulation.id}>
+                  {simulation.imageUrl && <img src={simulation.imageUrl} alt="" />}
+                  <div>
+                    <strong>{simulation.title}</strong>
+                    <span>{simulation.questions.length} preguntas / {simulation.scoreMax} puntos</span>
+                    {!simulation.isPublished && <StatusBadge status="reforzar" />}
+                  </div>
+                  <button className="secondary-btn" type="button" onClick={() => onEditSimulation(simulation)}>
+                    <Settings size={17} />
+                    Editar
+                  </button>
+                  <button className="danger-btn" type="button" onClick={() => onDeleteSimulation(simulation.id)}>
+                    <Trash2 size={17} />
+                    Eliminar
+                  </button>
+                </article>
+              ))}
+              {!managedSimulations.length && (
+                <div className="empty-state small">
+                  <h2>Aun no hay simulacros</h2>
+                  <p>Crea el primer simulacro global para que aparezca en la vista de estudiantes.</p>
+                </div>
+              )}
+            </div>
+          </section>
+        </section>
+      ) : (
+        <section className="simulation-workspace">
+        <aside className="simulation-list" aria-label="Lista de simulacros">
+          <div className="section-heading compact">
+            <div>
+              <p className="eyebrow">Biblioteca</p>
+              <h2>{loading ? 'Cargando...' : `${visibleSimulations.length} simulacro(s)`}</h2>
+            </div>
+          </div>
+
+          {visibleSimulations.map((simulation) => (
+            <button
+              className={simulation.id === activeSimulation?.id ? 'simulation-list-item active' : 'simulation-list-item'}
+              type="button"
+              onClick={() => setActiveSimulationId(simulation.id)}
+              key={simulation.id}
+            >
+              {simulation.imageUrl && <img src={simulation.imageUrl} alt="" />}
+              <span>{simulation.title}</span>
+              <small>{simulation.questions.length} preguntas / {simulation.scoreMax} puntos</small>
+              {!simulation.isPublished && <StatusBadge status="reforzar" className="simulation-private-badge" />}
+            </button>
+          ))}
+
+          {!loading && !visibleSimulations.length && (
+            <div className="empty-state small">
+              <h2>No hay simulacros disponibles</h2>
+              <p>{isAdmin ? 'Crea el primero desde el panel admin.' : 'Vuelve pronto para practicar con nuevas pruebas.'}</p>
+            </div>
+          )}
+        </aside>
+
+        <section className="simulation-player">
+          {activeSimulation ? (
+            <>
+              <div className="simulation-player-head">
+                <div>
+                  <p className="eyebrow">Practica activa</p>
+                  <h2>{activeSimulation.title}</h2>
+                  <p>{activeSimulation.description || 'Sin descripcion.'}</p>
+                </div>
+              </div>
+
+              {activeSimulation.imageUrl && <img className="simulation-cover" src={activeSimulation.imageUrl} alt="" />}
+
+              <div className="simulation-progress-line">
+                <span>{selectedCount}/{activeSimulation.questions.length} respondidas</span>
+                <span>Nota sobre {activeSimulation.scoreMax}</span>
+              </div>
+
+              <div className="simulation-questions">
+                {activeSimulation.questions.map((question, index) => (
+                  <article className="simulation-question" key={question.id}>
+                    <div className="simulation-question-head">
+                      <span>{index + 1}</span>
+                      <p>{question.prompt}</p>
+                    </div>
+                    {question.imageUrl && <img src={question.imageUrl} alt="" />}
+                    <div className="simulation-options">
+                      {ANSWER_OPTIONS.map((option) => (
+                        <button
+                          className={activeAnswers[question.id] === option ? 'active' : ''}
+                          type="button"
+                          onClick={() => onSetAnswer(activeSimulation.id, question.id, option)}
+                          key={option}
+                        >
+                          <strong>{option}</strong>
+                          <span>{question.options[option]}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </article>
+                ))}
+              </div>
+
+              {activeResult && (
+                <div className="simulation-result">
+                  <span>Nota final</span>
+                  <strong>{activeResult.score}/{activeSimulation.scoreMax}</strong>
+                  <p>{activeResult.correctCount} de {activeResult.questionCount} correctas.</p>
+                </div>
+              )}
+
+              <section className="simulation-attempt-history">
+                <div>
+                  <p className="eyebrow">Tus intentos</p>
+                  <h3>{activeAttempts.length ? `${activeAttempts.length} intento(s)` : 'Sin intentos aun'}</h3>
+                </div>
+                {activeAttempts.slice(0, 5).map((attempt) => (
+                  <article className="attempt-row" key={attempt.id}>
+                    <strong>{attempt.score}/{activeSimulation.scoreMax}</strong>
+                    <span>{attempt.correctCount}/{attempt.questionCount} correctas</span>
+                    <small>{formatDate(attempt.completedAt?.slice(0, 10))}</small>
+                  </article>
+                ))}
+              </section>
+
+              <Button
+                className="primary-btn simulation-submit"
+                type="button"
+                onClick={() => onSubmitAttempt(activeSimulation)}
+                loading={actionLoading === `submit-simulation-${activeSimulation.id}`}
+              >
+                <Check size={18} />
+                Terminar y calcular nota
+              </Button>
+            </>
+          ) : (
+            <div className="empty-state small">
+              <h2>Selecciona un simulacro</h2>
+              <p>Cuando exista una practica, aqui podras resolverla y ver tu nota en tiempo real.</p>
+            </div>
+          )}
+        </section>
+        </section>
+      )}
+    </main>
+  )
+}
+
+function ImageInput({ label, value, onChange }) {
+  const handleFileChange = (event) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+
+    const reader = new FileReader()
+    reader.onload = () => onChange(String(reader.result ?? ''))
+    reader.readAsDataURL(file)
+  }
+
+  return (
+    <div className="image-input">
+      <label>
+        {label}
+        <input value={value} onChange={(event) => onChange(event.target.value)} placeholder="Pega una URL o carga una imagen" />
+      </label>
+      <label className="file-picker image-picker">
+        <Upload size={18} />
+        Subir imagen
+        <input type="file" accept="image/*" onChange={handleFileChange} />
+      </label>
+      {value && <img src={value} alt="" />}
+    </div>
+  )
+}
+
+/*
+        <span className="beta-badge">Próximamente</span>
           <h2>{template?.shortName ? `Simulacros ${template.shortName}` : 'Simulacros por preparación'}</h2>
           <p>La idea es separar los simulacros por universidad, carrera objetivo y bloque de temas para que cada examen tenga su propio historial.</p>
-          <div className="beta-pill-row">
-            <span>Por universidad</span>
-            <span>Por curso</span>
-            <span>Por tema</span>
-          </div>
-        </article>
 
-        <article className="beta-card">
-          <span className="beta-icon"><Clock size={22} /></span>
-          <h2>Intentos y mejora</h2>
           <p>Se guardarán intentos semanales, puntaje, tiempo, aciertos, errores y evolución para que veas si estás mejorando con cada práctica.</p>
         </article>
 
-        <article className="beta-card">
-          <span className="beta-icon"><Target size={22} /></span>
           <h2>Diagnóstico por tema</h2>
           <p>Cuando esté activo, podrás detectar en qué cursos y temas fallas más, y convertir esos errores en temas para reforzar.</p>
         </article>
@@ -2095,7 +3179,9 @@ function WeeklySimulationPage({ exam }) {
   )
 }
 
-function WeeklySimulationRankingPage({ exam }) {
+*/
+// eslint-disable-next-line no-unused-vars
+function LegacyWeeklySimulationRankingPage({ exam }) {
   const template = getTemplateForExam(exam)
 
   return (
@@ -2144,6 +3230,132 @@ function WeeklySimulationRankingPage({ exam }) {
           <h2>Historial de intentos</h2>
           <p>Seguimiento de mejora entre simulacros para ver si tu rendimiento sube o se estanca.</p>
         </article>
+      </section>
+    </main>
+  )
+}
+
+function WeeklySimulationRankingPage({
+  simulations,
+  rankings,
+  loading,
+  error,
+  activeSimulationId,
+  setActiveSimulationId,
+  currentUserId,
+}) {
+  const [query, setQuery] = useState('')
+  const publishedSimulations = simulations.filter((simulation) => simulation.isPublished)
+  const activeSimulation = publishedSimulations.find((simulation) => simulation.id === activeSimulationId) ?? publishedSimulations[0] ?? null
+  const activeRows = activeSimulation
+    ? rankings
+      .filter((row) => row.simulationId === activeSimulation.id)
+      .sort((a, b) => b.bestScore - a.bestScore || b.bestCorrectCount - a.bestCorrectCount || a.displayName.localeCompare(b.displayName))
+    : []
+  const rankedRows = activeRows.map((row, index) => ({ ...row, rank: index + 1 }))
+  const filteredRows = rankedRows.filter((row) => row.displayName.toLowerCase().includes(query.trim().toLowerCase()))
+
+  return (
+    <main className="dashboard simulation-page ranking-page reveal">
+      <section className="simulation-hero">
+        <div>
+          <p className="eyebrow">Rankings por simulacro</p>
+          <h1>Ranking</h1>
+          <p>Elige un simulacro global y compara el mejor intento de cada usuario.</p>
+        </div>
+        <span className="global-summary">
+          <Trophy size={18} />
+          {publishedSimulations.length} simulacro(s)
+        </span>
+      </section>
+
+      {error && <div className="template-warning">{error}</div>}
+
+      <section className="simulation-workspace ranking-workspace">
+        <aside className="simulation-list" aria-label="Simulacros con ranking">
+          <div className="section-heading compact">
+            <div>
+              <p className="eyebrow">Simulacros</p>
+              <h2>{loading ? 'Cargando...' : 'Disponibles'}</h2>
+            </div>
+          </div>
+
+          {publishedSimulations.map((simulation) => {
+            const rowCount = rankings.filter((row) => row.simulationId === simulation.id).length
+
+            return (
+              <button
+                className={simulation.id === activeSimulation?.id ? 'simulation-list-item active' : 'simulation-list-item'}
+                type="button"
+                onClick={() => setActiveSimulationId(simulation.id)}
+                key={simulation.id}
+              >
+                {simulation.imageUrl && <img src={simulation.imageUrl} alt="" />}
+                <span>{simulation.title}</span>
+                <small>{rowCount} estudiante(s) rankeados</small>
+              </button>
+            )
+          })}
+
+          {!loading && !publishedSimulations.length && (
+            <div className="empty-state small">
+              <h2>No hay simulacros publicados</h2>
+              <p>Cuando el admin publique uno, aparecera aqui con su ranking.</p>
+            </div>
+          )}
+        </aside>
+
+        <section className="simulation-player ranking-panel">
+          {activeSimulation ? (
+            <>
+              <div className="simulation-player-head">
+                <div>
+                  <p className="eyebrow">Ranking activo</p>
+                  <h2>{activeSimulation.title}</h2>
+                  <p>{activeRows.length} usuario(s) con intentos registrados.</p>
+                </div>
+                <div className="course-search ranking-search">
+                  <Search size={17} />
+                  <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Buscar usuario" />
+                </div>
+              </div>
+
+              <div className="simulation-ranking-list">
+                {filteredRows.map((row) => (
+                  <article className={row.userId === currentUserId ? 'simulation-ranking-row you' : 'simulation-ranking-row'} key={row.userId}>
+                    <span className="rank-number">{row.rank}</span>
+                    <span className="leader-avatar">{row.displayName.slice(0, 1).toUpperCase()}</span>
+                    <div className="leader-name">
+                      <strong>{row.displayName}</strong>
+                      <span>{row.attemptCount} intento(s) / ultimo {formatDate(row.lastCompletedAt?.slice(0, 10))}</span>
+                    </div>
+                    <div className="leader-streak">
+                      <Trophy size={21} />
+                      <strong>{row.bestScore}</strong>
+                      <span>mejor nota</span>
+                    </div>
+                    <div className="leader-best">
+                      <span>Aciertos</span>
+                      <strong>{row.bestCorrectCount}/{row.questionCount}</strong>
+                    </div>
+                  </article>
+                ))}
+
+                {!loading && !filteredRows.length && (
+                  <div className="empty-state small">
+                    <h2>{query ? 'Sin coincidencias' : 'Aun no hay ranking'}</h2>
+                    <p>{query ? 'Prueba buscando otro nombre.' : 'El ranking aparecera cuando alguien termine este simulacro.'}</p>
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="empty-state small">
+              <h2>Selecciona un simulacro</h2>
+              <p>Los rankings son generales para todos los usuarios.</p>
+            </div>
+          )}
+        </section>
       </section>
     </main>
   )

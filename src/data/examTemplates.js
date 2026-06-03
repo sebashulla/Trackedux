@@ -5,6 +5,8 @@ export const TOPIC_STATUS_OPTIONS = [
   { value: 'reforzar', label: 'Reforzar' },
 ]
 
+export const OFFICIAL_TEMPLATE_STRUCTURE_NOTE = 'Esta estructura sigue el temario oficial o referencial del examen. Algunas areas pueden estar agrupadas segun la fuente original, aunque visualmente parezcan pertenecer a otro curso. Puedes editar la plantilla despues de crearla.'
+
 export const ACADEMIC_AREAS = [
   { value: 'area-a', label: 'Area A: Ciencias de la Salud' },
   { value: 'area-b', label: 'Area B: Ciencias Basicas' },
@@ -29,7 +31,7 @@ export const EXAM_TEMPLATES = [
     institution: 'Universidad Nacional Mayor de San Marcos',
     version: '2026-II inicial',
     description: 'Plantilla basada en el temario general de admision UNMSM.',
-    sourceNote: 'Plantilla referencial basada en el temario de admision UNMSM. Revisa siempre el prospecto oficial actualizado.',
+    sourceNote: `Plantilla referencial basada en el temario de admision UNMSM. Revisa siempre el prospecto oficial actualizado. ${OFFICIAL_TEMPLATE_STRUCTURE_NOTE}`,
     fields: [
       {
         name: 'academicArea',
@@ -255,7 +257,7 @@ export const EXAM_TEMPLATES = [
     institution: 'Universidad Nacional de Ingeniería',
     version: '2026 inicial',
     description: 'Plantilla basada en el temario de admisión UNI.',
-    sourceNote: 'Plantilla referencial basada en el temario de admisión UNI. Revisa siempre el prospecto oficial actualizado.',
+    sourceNote: `Plantilla referencial basada en el temario de admisión UNI. Revisa siempre el prospecto oficial actualizado. ${OFFICIAL_TEMPLATE_STRUCTURE_NOTE}`,
     fields: [
       {
         name: 'targetCareer',
