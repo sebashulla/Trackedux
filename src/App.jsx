@@ -40,9 +40,20 @@ import {
 } from 'lucide-react'
 import TemplateSelector from './components/TemplateSelector'
 import StatusBadge from './components/StatusBadge'
+import SubjectSelect from './components/SubjectSelect'
+import SubjectStatsCard from './components/SubjectStatsCard'
+import GlobalComparisonCard from './components/GlobalComparisonCard'
+import CourseDiagnosis from './components/CourseDiagnosis'
 import { EXAM_TEMPLATES, OFFICIAL_TEMPLATE_STRUCTURE_NOTE, TOPIC_STATUS_OPTIONS, getExamTemplateByCode, getTemplateFormDefaults } from './data/examTemplates'
+import { EXAM_SUBJECTS_WITH_FALLBACK_IDS, UNASSIGNED_SUBJECT } from './data/subjects'
 import { createPreparationFromTemplate } from './lib/templateService'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
+import {
+  buildCourseDiagnosis,
+  buildSubjectComparisons,
+  calculateSubjectStats,
+  formatPercentage,
+} from './utils/analytics'
 import {
   TOPICS_CSV_TEMPLATE,
   getCourseStatus,
@@ -333,6 +344,9 @@ const createEmptyQuestion = (position = 0) => ({
   id: createDraftId(),
   prompt: '',
   imageUrl: '',
+  subjectId: '',
+  subjectName: '',
+  subjectSlug: '',
   options: Object.fromEntries(ANSWER_OPTIONS.map((option) => [option, ''])),
   correctOption: 'A',
   position,
@@ -348,6 +362,35 @@ const createEmptySimulationDraft = () => ({
   questions: [createEmptyQuestion()],
 })
 
+const normalizeExamSubjectRow = (row) => ({
+  id: row.id,
+  name: row.name,
+  slug: row.slug,
+  area: row.area ?? null,
+  sortOrder: row.sort_order ?? row.sortOrder ?? 0,
+  isActive: row.is_active ?? row.isActive ?? true,
+})
+
+const normalizeQuestionSubject = (question) => {
+  const subject = question.course ?? question.exam_subjects ?? question.subject ?? null
+
+  if (!question.course_id && !subject?.id) {
+    return {
+      subjectId: '',
+      subjectName: UNASSIGNED_SUBJECT.name,
+      subjectSlug: UNASSIGNED_SUBJECT.slug,
+      subjectSortOrder: UNASSIGNED_SUBJECT.sortOrder,
+    }
+  }
+
+  return {
+    subjectId: question.course_id ?? subject?.id ?? '',
+    subjectName: subject?.name ?? UNASSIGNED_SUBJECT.name,
+    subjectSlug: subject?.slug ?? UNASSIGNED_SUBJECT.slug,
+    subjectSortOrder: subject?.sort_order ?? subject?.sortOrder ?? 9999,
+  }
+}
+
 const normalizeSimulationRow = (row) => ({
   id: row.id,
   title: row.title,
@@ -362,6 +405,7 @@ const normalizeSimulationRow = (row) => ({
       id: question.id,
       prompt: question.prompt,
       imageUrl: question.image_url ?? '',
+      ...normalizeQuestionSubject(question),
       correctOption: question.correct_option ?? 'A',
       position: question.position ?? 0,
       options: {
@@ -391,17 +435,33 @@ const calculateSimulationResult = (simulation, answers) => {
   const questionCount = simulation.questions.length
   const correctCount = simulation.questions.filter((question) => answers[question.id] === question.correctOption).length
   const score = questionCount ? Number(((correctCount / questionCount) * simulation.scoreMax).toFixed(2)) : 0
+  const subjectStats = calculateSubjectStats(answers, simulation.questions)
 
-  return { correctCount, questionCount, score }
+  return { correctCount, questionCount, score, subjectStats }
 }
 
 const normalizeSimulationAttempt = (row) => ({
   id: row.id,
   simulationId: row.simulation_id,
+  answers: row.answers ?? {},
   score: Number(row.score ?? 0),
   correctCount: row.correct_count ?? 0,
   questionCount: row.question_count ?? 0,
   completedAt: row.completed_at,
+})
+
+const normalizeSimulationSubjectAnalyticsRow = (row) => ({
+  simulationId: row.simulation_id,
+  subjectId: row.subject_id ?? '',
+  subjectName: row.subject_name ?? UNASSIGNED_SUBJECT.name,
+  subjectSlug: row.subject_slug ?? UNASSIGNED_SUBJECT.slug,
+  questionCount: row.question_count ?? 0,
+  globalAverage: row.global_average_percentage == null ? null : Number(row.global_average_percentage),
+  globalUserCount: row.global_user_count ?? 0,
+  peerAverage: row.peer_average_percentage == null ? null : Number(row.peer_average_percentage),
+  peerUserCount: row.peer_user_count ?? 0,
+  currentUserRank: row.current_user_rank ?? null,
+  participantCount: row.participant_count ?? 0,
 })
 
 const normalizeSimulationRankingRow = (row) => ({
@@ -479,12 +539,19 @@ function App() {
   const [simulations, setSimulations] = useState([])
   const [simulationsLoading, setSimulationsLoading] = useState(false)
   const [simulationsError, setSimulationsError] = useState('')
+  const [examSubjects, setExamSubjects] = useState(EXAM_SUBJECTS_WITH_FALLBACK_IDS)
+  const [examSubjectsReady, setExamSubjectsReady] = useState(false)
+  const [examSubjectsLoading, setExamSubjectsLoading] = useState(false)
+  const [simulationSubjectSchemaReady, setSimulationSubjectSchemaReady] = useState(true)
   const [activeSimulationId, setActiveSimulationId] = useState(null)
   const [simulationDraft, setSimulationDraft] = useState(createEmptySimulationDraft)
   const [simulationAnswers, setSimulationAnswers] = useState({})
   const [simulationResults, setSimulationResults] = useState({})
   const [simulationAttempts, setSimulationAttempts] = useState([])
   const [simulationRankings, setSimulationRankings] = useState([])
+  const [simulationSubjectAnalytics, setSimulationSubjectAnalytics] = useState({})
+  const [simulationSubjectAnalyticsLoading, setSimulationSubjectAnalyticsLoading] = useState({})
+  const [simulationSubjectAnalyticsErrors, setSimulationSubjectAnalyticsErrors] = useState({})
   const [simulationRankingLoading, setSimulationRankingLoading] = useState(false)
   const [simulationRankingError, setSimulationRankingError] = useState('')
   const [activeRankingSimulationId, setActiveRankingSimulationId] = useState(null)
@@ -653,15 +720,38 @@ function App() {
     }
   }, [session])
 
+  const fetchExamSubjects = useCallback(async () => {
+    if (!session?.user?.id || !supabase) return
+
+    setExamSubjectsLoading(true)
+    try {
+      const { data, error } = await supabase
+        .from('exam_subjects')
+        .select('id, name, slug, area, sort_order, is_active')
+        .eq('is_active', true)
+        .order('sort_order', { ascending: true })
+        .order('name', { ascending: true })
+
+      if (error) throw error
+
+      const mappedSubjects = (data ?? []).map(normalizeExamSubjectRow)
+      setExamSubjects(mappedSubjects.length ? mappedSubjects : EXAM_SUBJECTS_WITH_FALLBACK_IDS)
+      setExamSubjectsReady(Boolean(mappedSubjects.length))
+    } catch {
+      setExamSubjects(EXAM_SUBJECTS_WITH_FALLBACK_IDS)
+      setExamSubjectsReady(false)
+    } finally {
+      setExamSubjectsLoading(false)
+    }
+  }, [session?.user?.id])
+
   const fetchSimulations = useCallback(async () => {
     if (!session?.user?.id || !supabase) return
 
     setSimulationsLoading(true)
     setSimulationsError('')
     try {
-      const { data, error } = await supabase
-        .from('simulations')
-        .select(`
+      const baseSimulationSelect = `
           id,
           title,
           description,
@@ -682,9 +772,59 @@ function App() {
             correct_option,
             position
           )
-        `)
+        `
+      const subjectSimulationSelect = `
+          id,
+          title,
+          description,
+          image_url,
+          score_max,
+          is_published,
+          created_by,
+          created_at,
+          simulation_questions (
+            id,
+            prompt,
+            image_url,
+            option_a,
+            option_b,
+            option_c,
+            option_d,
+            option_e,
+            correct_option,
+            position,
+            course_id,
+            course:exam_subjects (
+              id,
+              name,
+              slug,
+              sort_order
+            )
+          )
+        `
+
+      let response = await supabase
+        .from('simulations')
+        .select(subjectSimulationSelect)
         .order('created_at', { ascending: false })
 
+      if (
+        response.error
+        && (
+          isMissingColumnError(response.error)
+          || /exam_subjects|course_id|relationship|relation/i.test(response.error?.message ?? '')
+        )
+      ) {
+        setSimulationSubjectSchemaReady(false)
+        response = await supabase
+          .from('simulations')
+          .select(baseSimulationSelect)
+          .order('created_at', { ascending: false })
+      } else {
+        setSimulationSubjectSchemaReady(true)
+      }
+
+      const { data, error } = response
       if (error) throw error
 
       const mappedSimulations = (data ?? []).map(normalizeSimulationRow)
@@ -718,7 +858,7 @@ function App() {
     try {
       const { data, error } = await supabase
         .from('simulation_attempts')
-        .select('id, simulation_id, correct_count, question_count, score, completed_at')
+        .select('id, simulation_id, answers, correct_count, question_count, score, completed_at')
         .eq('user_id', currentUserId)
         .order('completed_at', { ascending: false })
 
@@ -751,6 +891,36 @@ function App() {
       setSimulationRankingLoading(false)
     }
   }, [session?.user?.id])
+
+  const fetchSimulationSubjectAnalytics = useCallback(async (simulationId, { force = false } = {}) => {
+    if (!session?.user?.id || !supabase || !simulationId) return
+    if (!force && simulationSubjectAnalytics[simulationId]) return
+
+    setSimulationSubjectAnalyticsLoading((current) => ({ ...current, [simulationId]: true }))
+    setSimulationSubjectAnalyticsErrors((current) => ({ ...current, [simulationId]: '' }))
+
+    try {
+      const { data, error } = await supabase.rpc('get_simulation_subject_averages', {
+        target_simulation_id: simulationId,
+      })
+      if (error) throw error
+
+      setSimulationSubjectAnalytics((current) => ({
+        ...current,
+        [simulationId]: (data ?? []).map(normalizeSimulationSubjectAnalyticsRow),
+      }))
+    } catch (error) {
+      setSimulationSubjectAnalytics((current) => ({ ...current, [simulationId]: [] }))
+      setSimulationSubjectAnalyticsErrors((current) => ({
+        ...current,
+        [simulationId]: /get_simulation_subject_averages|function|schema cache/i.test(error?.message ?? '')
+          ? 'Ejecuta supabase/simulado_subject_analytics.sql para activar la comparativa por curso.'
+          : normalizeError(error),
+      }))
+    } finally {
+      setSimulationSubjectAnalyticsLoading((current) => ({ ...current, [simulationId]: false }))
+    }
+  }, [session?.user?.id, simulationSubjectAnalytics])
 
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase) return undefined
@@ -800,6 +970,12 @@ function App() {
 
   useEffect(() => {
     if (session?.user?.id) {
+      Promise.resolve().then(() => fetchExamSubjects())
+    }
+  }, [fetchExamSubjects, session?.user?.id])
+
+  useEffect(() => {
+    if (session?.user?.id) {
       Promise.resolve().then(() => fetchSimulations())
     }
   }, [fetchSimulations, session?.user?.id])
@@ -810,6 +986,18 @@ function App() {
       Promise.resolve().then(() => fetchSimulationRankings())
     }
   }, [fetchSimulationAttempts, fetchSimulationRankings, session?.user?.id])
+
+  useEffect(() => {
+    if (activeSimulationId) {
+      Promise.resolve().then(() => fetchSimulationSubjectAnalytics(activeSimulationId))
+    }
+  }, [activeSimulationId, fetchSimulationSubjectAnalytics])
+
+  useEffect(() => {
+    if (activeRankingSimulationId) {
+      Promise.resolve().then(() => fetchSimulationSubjectAnalytics(activeRankingSimulationId))
+    }
+  }, [activeRankingSimulationId, fetchSimulationSubjectAnalytics])
 
   const activeExam = useMemo(
     () => exams.find((exam) => exam.id === activeExamId) ?? exams[0] ?? null,
@@ -1277,9 +1465,11 @@ function App() {
       ...question,
       prompt: question.prompt.trim(),
       imageUrl: question.imageUrl.trim(),
+      subjectId: question.subjectId ?? '',
       options: Object.fromEntries(ANSWER_OPTIONS.map((option) => [option, question.options[option].trim()])),
       position: index,
     }))
+    const hasQuestionsWithoutSubject = validQuestions.some((question) => !question.subjectId)
 
     if (!title) {
       showToast('Escribe el nombre del simulacro.', 'error')
@@ -1288,6 +1478,20 @@ function App() {
 
     if (!validQuestions.length || validQuestions.some((question) => !question.prompt || ANSWER_OPTIONS.some((option) => !question.options[option]))) {
       showToast('Completa el texto y las alternativas A, B, C, D y E de cada pregunta.', 'error')
+      return
+    }
+
+    if (simulationSubjectSchemaReady && !simulationDraft.id && hasQuestionsWithoutSubject) {
+      showToast('Selecciona un curso para cada pregunta del nuevo simulacro.', 'error')
+      return
+    }
+
+    if (
+      simulationSubjectSchemaReady
+      && simulationDraft.id
+      && hasQuestionsWithoutSubject
+      && !window.confirm('Hay preguntas sin curso asignado. Esto afectara las estadisticas por curso. ¿Deseas guardar de todos modos?')
+    ) {
       return
     }
 
@@ -1336,8 +1540,14 @@ function App() {
         correct_option: question.correctOption,
         position: question.position,
       }))
+      const questionRowsWithSubjects = simulationSubjectSchemaReady
+        ? questionRows.map((question, index) => ({
+          ...question,
+          course_id: validQuestions[index].subjectId || null,
+        }))
+        : questionRows
 
-      const { error: questionsError } = await supabase.from('simulation_questions').insert(questionRows)
+      const { error: questionsError } = await supabase.from('simulation_questions').insert(questionRowsWithSubjects)
       if (questionsError) throw questionsError
 
       await fetchSimulations()
@@ -1397,6 +1607,7 @@ function App() {
       if (error) throw error
       await fetchSimulationAttempts()
       await fetchSimulationRankings()
+      await fetchSimulationSubjectAnalytics(simulation.id, { force: true })
       showToast(`Nota calculada: ${result.score}/${simulation.scoreMax}.`, 'success')
     })
   }
@@ -1545,9 +1756,18 @@ function App() {
           setActiveSimulationId={setActiveSimulationId}
           draft={simulationDraft}
           setDraft={setSimulationDraft}
+          subjects={examSubjects}
+          subjectsReady={examSubjectsReady}
+          subjectsLoading={examSubjectsLoading}
+          subjectSchemaReady={simulationSubjectSchemaReady}
           answers={simulationAnswers}
           results={simulationResults}
           attempts={simulationAttempts}
+          rankings={simulationRankings}
+          currentUserId={session.user.id}
+          subjectAnalytics={simulationSubjectAnalytics}
+          subjectAnalyticsLoading={simulationSubjectAnalyticsLoading}
+          subjectAnalyticsErrors={simulationSubjectAnalyticsErrors}
           onNewSimulation={startNewSimulation}
           onEditSimulation={editSimulation}
           onSaveSimulation={saveSimulation}
@@ -1565,6 +1785,9 @@ function App() {
           activeSimulationId={activeRankingSimulationId}
           setActiveSimulationId={setActiveRankingSimulationId}
           currentUserId={session.user.id}
+          subjectAnalytics={simulationSubjectAnalytics}
+          subjectAnalyticsLoading={simulationSubjectAnalyticsLoading}
+          subjectAnalyticsErrors={simulationSubjectAnalyticsErrors}
         />
       ) : view === 'global' ? (
         <GlobalPage
@@ -2801,9 +3024,18 @@ function WeeklySimulationPage({
   setActiveSimulationId,
   draft,
   setDraft,
+  subjects,
+  subjectsReady,
+  subjectsLoading,
+  subjectSchemaReady,
   answers,
   results,
   attempts,
+  rankings,
+  currentUserId,
+  subjectAnalytics,
+  subjectAnalyticsLoading,
+  subjectAnalyticsErrors,
   onNewSimulation,
   onEditSimulation,
   onSaveSimulation,
@@ -2817,9 +3049,41 @@ function WeeklySimulationPage({
   const managedSimulations = simulations
   const activeSimulation = visibleSimulations.find((simulation) => simulation.id === activeSimulationId) ?? visibleSimulations[0] ?? null
   const activeAnswers = activeSimulation ? (answers[activeSimulation.id] ?? {}) : {}
-  const activeResult = activeSimulation ? results[activeSimulation.id] : null
   const activeAttempts = activeSimulation ? attempts.filter((attempt) => attempt.simulationId === activeSimulation.id) : []
+  const activeResult = useMemo(() => {
+    if (!activeSimulation) return null
+    const currentResult = results[activeSimulation.id]
+    if (currentResult) return currentResult
+
+    const latestAttempt = activeAttempts[0]
+    if (!latestAttempt?.answers) return null
+
+    return {
+      score: latestAttempt.score,
+      correctCount: latestAttempt.correctCount,
+      questionCount: latestAttempt.questionCount,
+      subjectStats: calculateSubjectStats(latestAttempt.answers, activeSimulation.questions),
+    }
+  }, [activeAttempts, activeSimulation, results])
   const selectedCount = Object.keys(activeAnswers).length
+  const activeRankingRows = activeSimulation
+    ? (rankings ?? [])
+      .filter((row) => row.simulationId === activeSimulation.id)
+      .sort((a, b) => b.bestScore - a.bestScore || b.bestCorrectCount - a.bestCorrectCount || a.displayName.localeCompare(b.displayName))
+      .map((row, index) => ({ ...row, rank: index + 1 }))
+    : []
+  const activeUserRank = activeRankingRows.find((row) => row.userId === currentUserId)?.rank ?? null
+  const activeSubjectAnalytics = activeSimulation ? (subjectAnalytics?.[activeSimulation.id] ?? []) : []
+  const activeSubjectComparisons = useMemo(
+    () => buildSubjectComparisons(activeResult?.subjectStats ?? [], activeSubjectAnalytics),
+    [activeResult, activeSubjectAnalytics],
+  )
+  const activeDiagnosis = useMemo(
+    () => buildCourseDiagnosis(activeResult?.subjectStats ?? [], activeSubjectComparisons),
+    [activeResult, activeSubjectComparisons],
+  )
+  const hasDraftQuestionsWithoutSubject = draft.questions.some((question) => !question.subjectId)
+  const subjectSelectDisabled = !subjectSchemaReady || !subjectsReady || subjectsLoading
 
   const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }))
   const updateQuestion = (index, patch) => {
@@ -2932,6 +3196,18 @@ function WeeklySimulationPage({
 
             <ImageInput label="Imagen del simulacro" value={draft.imageUrl} onChange={(value) => updateDraft('imageUrl', value)} />
 
+            {!subjectSchemaReady && (
+              <div className="template-warning">
+                Ejecuta supabase/simulado_subject_analytics.sql para activar cursos por pregunta y comparativas.
+              </div>
+            )}
+
+            {subjectSchemaReady && hasDraftQuestionsWithoutSubject && (
+              <div className="template-warning">
+                Hay preguntas sin curso asignado. Esto afectara las estadisticas por curso.
+              </div>
+            )}
+
             <div className="question-editor-list">
               {draft.questions.map((question, index) => (
                 <article className="question-editor" key={question.id}>
@@ -2952,6 +3228,15 @@ function WeeklySimulationPage({
                   </label>
 
                   <ImageInput label="Imagen de la pregunta" value={question.imageUrl} onChange={(value) => updateQuestion(index, { imageUrl: value })} />
+
+                  <SubjectSelect
+                    value={question.subjectId}
+                    subjects={subjects}
+                    disabled={subjectSelectDisabled}
+                    required={subjectSchemaReady && !draft.id}
+                    showUnassignedWarning={subjectSchemaReady && !question.subjectId}
+                    onChange={(value) => updateQuestion(index, { subjectId: value })}
+                  />
 
                   <div className="answer-grid">
                     {ANSWER_OPTIONS.map((option) => (
@@ -2999,6 +3284,9 @@ function WeeklySimulationPage({
                   <div>
                     <strong>{simulation.title}</strong>
                     <span>{simulation.questions.length} preguntas / {simulation.scoreMax} puntos</span>
+                    {simulation.questions.some((question) => !question.subjectId) && (
+                      <small className="subject-warning-text">Tiene preguntas sin curso asignado</small>
+                    )}
                     {!simulation.isPublished && <StatusBadge status="reforzar" />}
                   </div>
                   <button className="secondary-btn" type="button" onClick={() => onEditSimulation(simulation)}>
@@ -3075,7 +3363,10 @@ function WeeklySimulationPage({
                   <article className="simulation-question" key={question.id}>
                     <div className="simulation-question-head">
                       <span>{index + 1}</span>
-                      <p>{question.prompt}</p>
+                      <div className="simulation-question-copy">
+                        <p>{question.prompt}</p>
+                        <small>{question.subjectName || UNASSIGNED_SUBJECT.name}</small>
+                      </div>
                     </div>
                     {question.imageUrl && <img src={question.imageUrl} alt="" />}
                     <div className="simulation-options">
@@ -3100,7 +3391,34 @@ function WeeklySimulationPage({
                   <span>Nota final</span>
                   <strong>{activeResult.score}/{activeSimulation.scoreMax}</strong>
                   <p>{activeResult.correctCount} de {activeResult.questionCount} correctas.</p>
+                  {activeUserRank && <p>Puesto actual en ranking: #{activeUserRank}</p>}
                 </div>
+              )}
+
+              {activeResult?.subjectStats?.length > 0 && (
+                <>
+                  <CourseDiagnosis diagnosis={activeDiagnosis} />
+
+                  <section className="subject-panel subject-detail-panel">
+                    <div className="section-heading compact">
+                      <div>
+                        <p className="eyebrow">Detalle</p>
+                        <h3>Rendimiento por curso</h3>
+                      </div>
+                    </div>
+                    <div className="subject-stats-grid">
+                      {activeSubjectComparisons.map((stat) => (
+                        <SubjectStatsCard stat={stat} key={stat.subjectKey} />
+                      ))}
+                    </div>
+                  </section>
+
+                  <GlobalComparisonCard
+                    comparisons={activeSubjectComparisons}
+                    loading={Boolean(subjectAnalyticsLoading?.[activeSimulation.id])}
+                    error={subjectAnalyticsErrors?.[activeSimulation.id] ?? ''}
+                  />
+                </>
               )}
 
               <section className="simulation-attempt-history">
@@ -3246,6 +3564,9 @@ function WeeklySimulationRankingPage({
   activeSimulationId,
   setActiveSimulationId,
   currentUserId,
+  subjectAnalytics,
+  subjectAnalyticsLoading,
+  subjectAnalyticsErrors,
 }) {
   const [query, setQuery] = useState('')
   const publishedSimulations = simulations.filter((simulation) => simulation.isPublished)
@@ -3257,6 +3578,17 @@ function WeeklySimulationRankingPage({
     : []
   const rankedRows = activeRows.map((row, index) => ({ ...row, rank: index + 1 }))
   const filteredRows = rankedRows.filter((row) => row.displayName.toLowerCase().includes(query.trim().toLowerCase()))
+  const activeSubjectAnalytics = activeSimulation ? (subjectAnalytics?.[activeSimulation.id] ?? []) : []
+  const subjectRowsWithAverage = activeSubjectAnalytics.filter((row) => row.globalAverage !== null && row.globalUserCount > 0)
+  const averageBestScore = activeRows.length
+    ? Number((activeRows.reduce((sum, row) => sum + row.bestScore, 0) / activeRows.length).toFixed(2))
+    : null
+  const highestSubject = subjectRowsWithAverage.reduce((best, row) => (
+    !best || row.globalAverage > best.globalAverage ? row : best
+  ), null)
+  const lowestSubject = subjectRowsWithAverage.reduce((worst, row) => (
+    !worst || row.globalAverage < worst.globalAverage ? row : worst
+  ), null)
 
   return (
     <main className="dashboard simulation-page ranking-page reveal">
@@ -3322,6 +3654,51 @@ function WeeklySimulationRankingPage({
                   <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Buscar usuario" />
                 </div>
               </div>
+
+              <section className="ranking-analytics-panel">
+                <div className="ranking-analytics-grid">
+                  <article>
+                    <span>Promedio general</span>
+                    <strong>{averageBestScore == null ? 'Sin datos' : `${averageBestScore}/${activeSimulation.scoreMax}`}</strong>
+                  </article>
+                  <article>
+                    <span>Mayor promedio por curso</span>
+                    <strong>
+                      {highestSubject
+                        ? `${highestSubject.subjectName} · ${formatPercentage(highestSubject.globalAverage)}`
+                        : 'Sin datos'}
+                    </strong>
+                  </article>
+                  <article>
+                    <span>Menor promedio por curso</span>
+                    <strong>
+                      {lowestSubject
+                        ? `${lowestSubject.subjectName} · ${formatPercentage(lowestSubject.globalAverage)}`
+                        : 'Sin datos'}
+                    </strong>
+                  </article>
+                </div>
+
+                {subjectAnalyticsLoading?.[activeSimulation.id] ? (
+                  <div className="comparison-empty">Calculando estadisticas por curso...</div>
+                ) : subjectAnalyticsErrors?.[activeSimulation.id] ? (
+                  <div className="comparison-empty warning">{subjectAnalyticsErrors[activeSimulation.id]}</div>
+                ) : subjectRowsWithAverage.length ? (
+                  <div className="ranking-subject-overview">
+                    {subjectRowsWithAverage.map((row) => (
+                      <div className="ranking-subject-row" key={row.subjectId || row.subjectSlug}>
+                        <span>{row.subjectName}</span>
+                        <div className="subject-progress-bar">
+                          <span style={{ width: `${Math.min(Math.max(row.globalAverage, 0), 100)}%` }} />
+                        </div>
+                        <strong>{formatPercentage(row.globalAverage)}</strong>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="comparison-empty">Aun no hay estadisticas globales por curso.</div>
+                )}
+              </section>
 
               <div className="simulation-ranking-list">
                 {filteredRows.map((row) => (

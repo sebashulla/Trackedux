@@ -19,6 +19,8 @@ build/
 !exam_templates_unmsm.sql
 !exam_templates_uni.sql
 supabase/
+!supabase/
+!supabase/simulado_subject_analytics.sql
 *.db
 *.sqlite
 *.sqlite3
