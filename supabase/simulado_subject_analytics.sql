@@ -1,5 +1,5 @@
 -- Ejecuta este archivo en el SQL Editor de Supabase despues de supabase/simulations.sql.
--- Agrega cursos por pregunta y agregados seguros por curso para simulacros.
+-- Agrega duracion, cursos por pregunta y agregados seguros por curso para simulacros.
 
 create extension if not exists pgcrypto;
 
@@ -91,6 +91,21 @@ grant select on public.exam_subjects to authenticated;
 
 do $$
 begin
+  if to_regclass('public.simulations') is not null then
+    alter table public.simulations
+      add column if not exists duration_minutes integer not null default 60;
+
+    if not exists (
+      select 1
+      from pg_constraint
+      where conname = 'simulations_duration_minutes_check'
+    ) then
+      alter table public.simulations
+        add constraint simulations_duration_minutes_check
+        check (duration_minutes >= 1 and duration_minutes <= 300);
+    end if;
+  end if;
+
   if to_regclass('public.simulation_questions') is not null then
     alter table public.simulation_questions
       add column if not exists course_id uuid;

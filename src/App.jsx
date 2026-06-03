@@ -104,6 +104,14 @@ const formatDate = (targetDate) => {
   })
 }
 
+const formatDuration = (totalSeconds) => {
+  const safeSeconds = Math.max(0, Number(totalSeconds) || 0)
+  const minutes = Math.floor(safeSeconds / 60)
+  const seconds = safeSeconds % 60
+
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
 const getDisplayName = (session, profile) => {
   if (profile?.display_name) return profile.display_name
   if (session?.user?.user_metadata?.display_name) return session.user.user_metadata.display_name
@@ -358,6 +366,7 @@ const createEmptySimulationDraft = () => ({
   description: '',
   imageUrl: '',
   scoreMax: 20,
+  durationMinutes: 60,
   isPublished: true,
   questions: [createEmptyQuestion()],
 })
@@ -397,6 +406,7 @@ const normalizeSimulationRow = (row) => ({
   description: row.description ?? '',
   imageUrl: row.image_url ?? '',
   scoreMax: Number(row.score_max ?? 20),
+  durationMinutes: Number(row.duration_minutes ?? 60),
   isPublished: row.is_published ?? true,
   createdBy: row.created_by,
   createdAt: row.created_at,
@@ -425,6 +435,7 @@ const simulationToDraft = (simulation) => ({
   description: simulation.description,
   imageUrl: simulation.imageUrl,
   scoreMax: simulation.scoreMax,
+  durationMinutes: simulation.durationMinutes,
   isPublished: simulation.isPublished,
   questions: simulation.questions.length
     ? simulation.questions.map((question, index) => ({ ...question, position: index }))
@@ -543,6 +554,7 @@ function App() {
   const [examSubjectsReady, setExamSubjectsReady] = useState(false)
   const [examSubjectsLoading, setExamSubjectsLoading] = useState(false)
   const [simulationSubjectSchemaReady, setSimulationSubjectSchemaReady] = useState(true)
+  const [simulationDurationSchemaReady, setSimulationDurationSchemaReady] = useState(true)
   const [activeSimulationId, setActiveSimulationId] = useState(null)
   const [simulationDraft, setSimulationDraft] = useState(createEmptySimulationDraft)
   const [simulationAnswers, setSimulationAnswers] = useState({})
@@ -802,11 +814,57 @@ function App() {
             )
           )
         `
+      const subjectAndDurationSimulationSelect = `
+          id,
+          title,
+          description,
+          image_url,
+          score_max,
+          duration_minutes,
+          is_published,
+          created_by,
+          created_at,
+          simulation_questions (
+            id,
+            prompt,
+            image_url,
+            option_a,
+            option_b,
+            option_c,
+            option_d,
+            option_e,
+            correct_option,
+            position,
+            course_id,
+            course:exam_subjects (
+              id,
+              name,
+              slug,
+              sort_order
+            )
+          )
+        `
 
       let response = await supabase
         .from('simulations')
-        .select(subjectSimulationSelect)
+        .select(subjectAndDurationSimulationSelect)
         .order('created_at', { ascending: false })
+
+      if (
+        response.error
+        && (
+          response.error?.code === '42703'
+          || /duration_minutes/i.test(response.error?.message ?? '')
+        )
+      ) {
+        setSimulationDurationSchemaReady(false)
+        response = await supabase
+          .from('simulations')
+          .select(subjectSimulationSelect)
+          .order('created_at', { ascending: false })
+      } else {
+        setSimulationDurationSchemaReady(true)
+      }
 
       if (
         response.error
@@ -816,6 +874,7 @@ function App() {
         )
       ) {
         setSimulationSubjectSchemaReady(false)
+        setSimulationDurationSchemaReady(false)
         response = await supabase
           .from('simulations')
           .select(baseSimulationSelect)
@@ -1461,6 +1520,7 @@ function App() {
 
     const title = simulationDraft.title.trim()
     const description = simulationDraft.description.trim()
+    const durationMinutes = Number(simulationDraft.durationMinutes)
     const validQuestions = simulationDraft.questions.map((question, index) => ({
       ...question,
       prompt: question.prompt.trim(),
@@ -1473,6 +1533,11 @@ function App() {
 
     if (!title) {
       showToast('Escribe el nombre del simulacro.', 'error')
+      return
+    }
+
+    if (!Number.isFinite(durationMinutes) || durationMinutes < 1) {
+      showToast('Define una duracion valida para el simulacro.', 'error')
       return
     }
 
@@ -1503,13 +1568,16 @@ function App() {
         score_max: Number(simulationDraft.scoreMax) || 20,
         is_published: simulationDraft.isPublished,
       }
+      const simulationPayloadWithDuration = simulationDurationSchemaReady
+        ? { ...simulationPayload, duration_minutes: Math.round(durationMinutes) }
+        : simulationPayload
 
       let simulationId = simulationDraft.id
 
       if (simulationId) {
         const { error } = await supabase
           .from('simulations')
-          .update(simulationPayload)
+          .update(simulationPayloadWithDuration)
           .eq('id', simulationId)
         if (error) throw error
 
@@ -1521,7 +1589,7 @@ function App() {
       } else {
         const { data, error } = await supabase
           .from('simulations')
-          .insert({ ...simulationPayload, created_by: session.user.id })
+          .insert({ ...simulationPayloadWithDuration, created_by: session.user.id })
           .select('id')
           .single()
         if (error) throw error
@@ -1582,11 +1650,13 @@ function App() {
     }))
   }
 
-  const submitSimulationAttempt = (simulation) => {
+  const submitSimulationAttempt = (simulation, options = {}) => {
     if (!session?.user?.id || !supabase) return
     const answers = simulationAnswers[simulation.id] ?? {}
+    const allowIncomplete = Boolean(options.allowIncomplete)
+    const isTimedOut = options.reason === 'timeout'
 
-    if (simulation.questions.some((question) => !answers[question.id])) {
+    if (!allowIncomplete && simulation.questions.some((question) => !answers[question.id])) {
       showToast('Responde todas las preguntas antes de terminar.', 'error')
       return
     }
@@ -1608,7 +1678,12 @@ function App() {
       await fetchSimulationAttempts()
       await fetchSimulationRankings()
       await fetchSimulationSubjectAnalytics(simulation.id, { force: true })
-      showToast(`Nota calculada: ${result.score}/${simulation.scoreMax}.`, 'success')
+      showToast(
+        isTimedOut
+          ? `Tiempo terminado. Nota calculada: ${result.score}/${simulation.scoreMax}.`
+          : `Nota calculada: ${result.score}/${simulation.scoreMax}.`,
+        isTimedOut ? 'info' : 'success',
+      )
     })
   }
 
@@ -1760,6 +1835,7 @@ function App() {
           subjectsReady={examSubjectsReady}
           subjectsLoading={examSubjectsLoading}
           subjectSchemaReady={simulationSubjectSchemaReady}
+          durationSchemaReady={simulationDurationSchemaReady}
           answers={simulationAnswers}
           results={simulationResults}
           attempts={simulationAttempts}
@@ -3028,6 +3104,7 @@ function WeeklySimulationPage({
   subjectsReady,
   subjectsLoading,
   subjectSchemaReady,
+  durationSchemaReady,
   answers,
   results,
   attempts,
@@ -3045,15 +3122,17 @@ function WeeklySimulationPage({
   actionLoading,
 }) {
   const [mode, setMode] = useState('student')
+  const [simulationTimers, setSimulationTimers] = useState({})
+  const [timedOutSimulations, setTimedOutSimulations] = useState({})
   const visibleSimulations = simulations.filter((simulation) => simulation.isPublished)
   const managedSimulations = simulations
   const activeSimulation = visibleSimulations.find((simulation) => simulation.id === activeSimulationId) ?? visibleSimulations[0] ?? null
   const activeAnswers = activeSimulation ? (answers[activeSimulation.id] ?? {}) : {}
   const activeAttempts = activeSimulation ? attempts.filter((attempt) => attempt.simulationId === activeSimulation.id) : []
+  const currentAttemptResult = activeSimulation ? results[activeSimulation.id] : null
   const activeResult = useMemo(() => {
     if (!activeSimulation) return null
-    const currentResult = results[activeSimulation.id]
-    if (currentResult) return currentResult
+    if (currentAttemptResult) return currentAttemptResult
 
     const latestAttempt = activeAttempts[0]
     if (!latestAttempt?.answers) return null
@@ -3064,8 +3143,14 @@ function WeeklySimulationPage({
       questionCount: latestAttempt.questionCount,
       subjectStats: calculateSubjectStats(latestAttempt.answers, activeSimulation.questions),
     }
-  }, [activeAttempts, activeSimulation, results])
+  }, [activeAttempts, activeSimulation, currentAttemptResult])
   const selectedCount = Object.keys(activeAnswers).length
+  const activeDurationSeconds = activeSimulation ? Math.max(60, Math.round(activeSimulation.durationMinutes || 60) * 60) : 0
+  const remainingSeconds = activeSimulation
+    ? simulationTimers[activeSimulation.id] ?? activeDurationSeconds
+    : 0
+  const isCurrentAttemptClosed = Boolean(currentAttemptResult)
+  const timerTone = remainingSeconds <= 60 ? 'critical' : remainingSeconds <= 300 ? 'warning' : ''
   const activeRankingRows = activeSimulation
     ? (rankings ?? [])
       .filter((row) => row.simulationId === activeSimulation.id)
@@ -3084,6 +3169,40 @@ function WeeklySimulationPage({
   )
   const hasDraftQuestionsWithoutSubject = draft.questions.some((question) => !question.subjectId)
   const subjectSelectDisabled = !subjectSchemaReady || !subjectsReady || subjectsLoading
+
+  useEffect(() => {
+    if (!activeSimulation || isCurrentAttemptClosed) return
+
+    setSimulationTimers((current) => (
+      current[activeSimulation.id] == null
+        ? { ...current, [activeSimulation.id]: activeDurationSeconds }
+        : current
+    ))
+  }, [activeDurationSeconds, activeSimulation, isCurrentAttemptClosed])
+
+  useEffect(() => {
+    if (!activeSimulation || isCurrentAttemptClosed) return undefined
+
+    const interval = window.setInterval(() => {
+      setSimulationTimers((current) => {
+        const currentRemaining = current[activeSimulation.id] ?? activeDurationSeconds
+        return {
+          ...current,
+          [activeSimulation.id]: Math.max(0, currentRemaining - 1),
+        }
+      })
+    }, 1000)
+
+    return () => window.clearInterval(interval)
+  }, [activeDurationSeconds, activeSimulation, isCurrentAttemptClosed])
+
+  useEffect(() => {
+    if (!activeSimulation || isCurrentAttemptClosed || remainingSeconds > 0 || timedOutSimulations[activeSimulation.id]) return
+    if (actionLoading === `submit-simulation-${activeSimulation.id}`) return
+
+    setTimedOutSimulations((current) => ({ ...current, [activeSimulation.id]: true }))
+    onSubmitAttempt(activeSimulation, { allowIncomplete: true, reason: 'timeout' })
+  }, [actionLoading, activeSimulation, isCurrentAttemptClosed, onSubmitAttempt, remainingSeconds, timedOutSimulations])
 
   const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }))
   const updateQuestion = (index, patch) => {
@@ -3175,6 +3294,18 @@ function WeeklySimulationPage({
                   onChange={(event) => updateDraft('scoreMax', event.target.value)}
                 />
               </label>
+              <label>
+                Duracion del examen (min)
+                <input
+                  type="number"
+                  min="1"
+                  max="300"
+                  step="1"
+                  required
+                  value={draft.durationMinutes}
+                  onChange={(event) => updateDraft('durationMinutes', event.target.value)}
+                />
+              </label>
               <label className="simulation-publish-toggle">
                 <input
                   type="checkbox"
@@ -3199,6 +3330,12 @@ function WeeklySimulationPage({
             {!subjectSchemaReady && (
               <div className="template-warning">
                 Ejecuta supabase/simulado_subject_analytics.sql para activar cursos por pregunta y comparativas.
+              </div>
+            )}
+
+            {!durationSchemaReady && (
+              <div className="template-warning">
+                Ejecuta supabase/simulado_subject_analytics.sql para guardar la duracion de cada simulacro.
               </div>
             )}
 
@@ -3283,7 +3420,7 @@ function WeeklySimulationPage({
                   {simulation.imageUrl && <img src={simulation.imageUrl} alt="" />}
                   <div>
                     <strong>{simulation.title}</strong>
-                    <span>{simulation.questions.length} preguntas / {simulation.scoreMax} puntos</span>
+                    <span>{simulation.questions.length} preguntas / {simulation.scoreMax} puntos / {simulation.durationMinutes} min</span>
                     {simulation.questions.some((question) => !question.subjectId) && (
                       <small className="subject-warning-text">Tiene preguntas sin curso asignado</small>
                     )}
@@ -3327,7 +3464,7 @@ function WeeklySimulationPage({
             >
               {simulation.imageUrl && <img src={simulation.imageUrl} alt="" />}
               <span>{simulation.title}</span>
-              <small>{simulation.questions.length} preguntas / {simulation.scoreMax} puntos</small>
+              <small>{simulation.questions.length} preguntas / {simulation.scoreMax} puntos / {simulation.durationMinutes} min</small>
               {!simulation.isPublished && <StatusBadge status="reforzar" className="simulation-private-badge" />}
             </button>
           ))}
@@ -3356,6 +3493,10 @@ function WeeklySimulationPage({
               <div className="simulation-progress-line">
                 <span>{selectedCount}/{activeSimulation.questions.length} respondidas</span>
                 <span>Nota sobre {activeSimulation.scoreMax}</span>
+                <span className={`simulation-timer ${timerTone}`.trim()}>
+                  <Clock size={16} />
+                  {isCurrentAttemptClosed ? 'Cerrado' : formatDuration(remainingSeconds)}
+                </span>
               </div>
 
               <div className="simulation-questions">
@@ -3374,6 +3515,7 @@ function WeeklySimulationPage({
                         <button
                           className={activeAnswers[question.id] === option ? 'active' : ''}
                           type="button"
+                          disabled={isCurrentAttemptClosed}
                           onClick={() => onSetAnswer(activeSimulation.id, question.id, option)}
                           key={option}
                         >
@@ -3440,9 +3582,10 @@ function WeeklySimulationPage({
                 type="button"
                 onClick={() => onSubmitAttempt(activeSimulation)}
                 loading={actionLoading === `submit-simulation-${activeSimulation.id}`}
+                disabled={isCurrentAttemptClosed}
               >
                 <Check size={18} />
-                Terminar y calcular nota
+                {isCurrentAttemptClosed ? 'Intento cerrado' : 'Terminar y calcular nota'}
               </Button>
             </>
           ) : (

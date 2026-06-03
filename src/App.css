@@ -1603,6 +1603,31 @@ button:disabled {
   background: var(--button-soft);
 }
 
+.simulation-timer {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  font-weight: 950;
+}
+
+.simulation-timer.warning {
+  border-color: rgba(245, 158, 11, 0.3);
+  color: #fde68a;
+  background: rgba(120, 83, 14, 0.24);
+}
+
+.simulation-timer.critical {
+  border-color: rgba(248, 113, 113, 0.3);
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.28);
+}
+
 .simulation-question {
   display: grid;
   gap: 14px;
