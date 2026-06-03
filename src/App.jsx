@@ -317,10 +317,13 @@ const CONTACT_LINKS = {
   secondaryEmail: 'sebas8shulla@outlook.es',
 }
 
-const ADMIN_USER_IDS = new Set(['66ec7f4b-ee05-42b4-81a6-482f044f6ea1'])
+const SIMULATION_ADMIN_USER_IDS = new Set([
+  '66ec7f4b-ee05-42b4-81a6-482f044f6ea1',
+  '244726d8-4d30-49de-8aa9-5996244e460b',
+])
 const ANSWER_OPTIONS = ['A', 'B', 'C', 'D', 'E']
 
-const isAdminUser = (userId) => ADMIN_USER_IDS.has(userId)
+const isSimulationAdminUser = (userId) => SIMULATION_ADMIN_USER_IDS.has(userId)
 
 const createDraftId = () => (
   window.crypto?.randomUUID?.() ?? `draft-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -821,7 +824,7 @@ function App() {
   const leaderboardEntries = buildLeaderboard(leaderboard, userStats, displayName, session?.user?.id)
   const publicPath = getPublicPath()
   const hasExistingTemplate = (template) => exams.some((exam) => isTemplatePreparation(exam, template))
-  const isAdmin = isAdminUser(session?.user?.id)
+  const isAdmin = isSimulationAdminUser(session?.user?.id)
 
   if (publicPath) {
     return <PublicRoute path={publicPath} isLoggedIn={Boolean(session)} />
@@ -2860,7 +2863,7 @@ function WeeklySimulationPage({
           <h1>Simulacros</h1>
           <p>Practicas publicadas para todos los usuarios, con nota inmediata y ranking global por simulacro.</p>
         </div>
-        {isAdmin && <span className="admin-badge">Admin activo</span>}
+        {isAdmin && <span className="admin-badge">Admin de simulacros</span>}
       </section>
 
       {error && <div className="template-warning">{error}</div>}
