@@ -41,7 +41,6 @@ import {
 import TemplateSelector from './components/TemplateSelector'
 import StatusBadge from './components/StatusBadge'
 import SubjectSelect from './components/SubjectSelect'
-import SubjectStatsCard from './components/SubjectStatsCard'
 import GlobalComparisonCard from './components/GlobalComparisonCard'
 import CourseDiagnosis from './components/CourseDiagnosis'
 import { EXAM_TEMPLATES, OFFICIAL_TEMPLATE_STRUCTURE_NOTE, TOPIC_STATUS_OPTIONS, getExamTemplateByCode, getTemplateFormDefaults } from './data/examTemplates'
@@ -367,6 +366,7 @@ const createEmptySimulationDraft = () => ({
   imageUrl: '',
   scoreMax: 20,
   durationMinutes: 60,
+  gradingWeights: {},
   isPublished: true,
   questions: [createEmptyQuestion()],
 })
@@ -400,6 +400,16 @@ const normalizeQuestionSubject = (question) => {
   }
 }
 
+const normalizeGradingWeights = (value) => {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+
+  return Object.fromEntries(
+    Object.entries(source)
+      .map(([subjectId, bonus]) => [subjectId, Number(bonus)])
+      .filter(([subjectId, bonus]) => subjectId && Number.isFinite(bonus) && bonus > 0),
+  )
+}
+
 const normalizeSimulationRow = (row) => ({
   id: row.id,
   title: row.title,
@@ -407,6 +417,7 @@ const normalizeSimulationRow = (row) => ({
   imageUrl: row.image_url ?? '',
   scoreMax: Number(row.score_max ?? 20),
   durationMinutes: Number(row.duration_minutes ?? 60),
+  gradingWeights: normalizeGradingWeights(row.grading_weights),
   isPublished: row.is_published ?? true,
   createdBy: row.created_by,
   createdAt: row.created_at,
@@ -436,19 +447,125 @@ const simulationToDraft = (simulation) => ({
   imageUrl: simulation.imageUrl,
   scoreMax: simulation.scoreMax,
   durationMinutes: simulation.durationMinutes,
+  gradingWeights: normalizeGradingWeights(simulation.gradingWeights),
   isPublished: simulation.isPublished,
   questions: simulation.questions.length
     ? simulation.questions.map((question, index) => ({ ...question, position: index }))
     : [createEmptyQuestion()],
 })
 
+const calculateQuestionPointValues = (simulation) => {
+  const questionCount = simulation.questions.length
+  const scoreMax = Number(simulation.scoreMax ?? 20)
+  if (!questionCount) return { pointByQuestionId: {}, subjectPointSummary: [], basePoint: 0 }
+
+  const basePoint = scoreMax / questionCount
+  const gradingWeights = normalizeGradingWeights(simulation.gradingWeights)
+  const hasWeights = Object.keys(gradingWeights).length > 0
+
+  if (!hasWeights) {
+    return {
+      pointByQuestionId: Object.fromEntries(simulation.questions.map((question) => [question.id, basePoint])),
+      subjectPointSummary: [],
+      basePoint,
+    }
+  }
+
+  const boostedQuestions = simulation.questions.filter((question) => Number(gradingWeights[question.subjectId] ?? 0) > 0)
+  const boostedTotal = boostedQuestions.reduce((sum, question) => (
+    sum + basePoint + Number(gradingWeights[question.subjectId] ?? 0)
+  ), 0)
+  const remainingQuestions = simulation.questions.length - boostedQuestions.length
+  const canAdjustRemaining = remainingQuestions > 0 && boostedTotal < scoreMax
+  const fallbackDesiredTotal = simulation.questions.reduce((sum, question) => (
+    sum + basePoint + Number(gradingWeights[question.subjectId] ?? 0)
+  ), 0)
+  const fallbackFactor = fallbackDesiredTotal ? scoreMax / fallbackDesiredTotal : 1
+  const remainingPoint = canAdjustRemaining ? (scoreMax - boostedTotal) / remainingQuestions : basePoint * fallbackFactor
+
+  const pointByQuestionId = Object.fromEntries(simulation.questions.map((question) => {
+    const bonus = Number(gradingWeights[question.subjectId] ?? 0)
+    const rawPoint = bonus > 0 ? basePoint + bonus : remainingPoint
+    const point = canAdjustRemaining ? rawPoint : rawPoint * (bonus > 0 ? fallbackFactor : 1)
+    return [question.id, Math.max(0, point)]
+  }))
+  const subjectGroups = simulation.questions.reduce((groups, question) => {
+    const key = question.subjectId || question.subjectName || UNASSIGNED_SUBJECT.name
+    const current = groups.get(key) ?? {
+      subjectId: question.subjectId,
+      subjectName: question.subjectName || UNASSIGNED_SUBJECT.name,
+      questionCount: 0,
+      totalPoints: 0,
+      pointPerQuestion: 0,
+      bonus: Number(gradingWeights[question.subjectId] ?? 0),
+    }
+
+    current.questionCount += 1
+    current.totalPoints += pointByQuestionId[question.id] ?? 0
+    current.pointPerQuestion = current.questionCount ? current.totalPoints / current.questionCount : 0
+    groups.set(key, current)
+    return groups
+  }, new Map())
+
+  return {
+    pointByQuestionId,
+    subjectPointSummary: Array.from(subjectGroups.values())
+      .sort((a, b) => b.totalPoints - a.totalPoints || a.subjectName.localeCompare(b.subjectName, 'es')),
+    basePoint,
+  }
+}
+
 const calculateSimulationResult = (simulation, answers) => {
   const questionCount = simulation.questions.length
   const correctCount = simulation.questions.filter((question) => answers[question.id] === question.correctOption).length
-  const score = questionCount ? Number(((correctCount / questionCount) * simulation.scoreMax).toFixed(2)) : 0
+  const { pointByQuestionId, subjectPointSummary } = calculateQuestionPointValues(simulation)
+  const weightedScore = simulation.questions.reduce((sum, question) => (
+    answers[question.id] === question.correctOption
+      ? sum + Number(pointByQuestionId[question.id] ?? 0)
+      : sum
+  ), 0)
+  const score = questionCount ? Number(Math.min(Number(simulation.scoreMax ?? 20), weightedScore).toFixed(2)) : 0
   const subjectStats = calculateSubjectStats(answers, simulation.questions)
 
-  return { correctCount, questionCount, score, subjectStats }
+  return { correctCount, questionCount, score, subjectStats, subjectPointSummary }
+}
+
+const getSimulationScoreFeedback = (score, scoreMax) => {
+  const percentage = scoreMax ? (score / scoreMax) * 100 : 0
+
+  if (percentage >= 85) {
+    return {
+      tone: 'excellent',
+      eyebrow: 'Resultado destacado',
+      title: 'Excelente dominio del simulacro',
+      message: 'Tu rendimiento fue alto. Ahora revisemos en que cursos conviene sostener el ritmo y donde puedes ganar puntos finos.',
+    }
+  }
+
+  if (percentage >= 65) {
+    return {
+      tone: 'good',
+      eyebrow: 'Buen avance',
+      title: 'Vas por buen camino',
+      message: 'Tu base esta respondiendo bien. El diagnostico separara cursos fuertes y cursos que aun pueden subir.',
+    }
+  }
+
+  if (percentage >= 40) {
+    return {
+      tone: 'regular',
+      eyebrow: 'Zona de mejora',
+      title: 'Hay oportunidades claras para subir',
+      message: 'El resultado muestra una ruta de refuerzo. Vamos a ordenar tus cursos por prioridad para estudiar con mas precision.',
+    }
+  }
+
+  return {
+    tone: 'critical',
+    eyebrow: 'Diagnostico critico',
+    title: 'Este intento necesita refuerzo dirigido',
+    message: 'No es un cierre, es informacion util. Vamos a detectar los cursos mas debiles y compararlos con tus intentos anteriores.',
+  }
 }
 
 const normalizeSimulationAttempt = (row) => ({
@@ -546,6 +663,7 @@ function App() {
   const [leaderboard, setLeaderboard] = useState([])
   const [leaderboardLoading, setLeaderboardLoading] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [simulationNavigationLocked, setSimulationNavigationLocked] = useState(false)
   const [editExamForm, setEditExamForm] = useState({ name: '', targetDate: '' })
   const [simulations, setSimulations] = useState([])
   const [simulationsLoading, setSimulationsLoading] = useState(false)
@@ -555,6 +673,7 @@ function App() {
   const [examSubjectsLoading, setExamSubjectsLoading] = useState(false)
   const [simulationSubjectSchemaReady, setSimulationSubjectSchemaReady] = useState(true)
   const [simulationDurationSchemaReady, setSimulationDurationSchemaReady] = useState(true)
+  const [simulationGradingSchemaReady, setSimulationGradingSchemaReady] = useState(true)
   const [activeSimulationId, setActiveSimulationId] = useState(null)
   const [simulationDraft, setSimulationDraft] = useState(createEmptySimulationDraft)
   const [simulationAnswers, setSimulationAnswers] = useState({})
@@ -844,11 +963,58 @@ function App() {
             )
           )
         `
+      const fullSimulationSelect = `
+          id,
+          title,
+          description,
+          image_url,
+          score_max,
+          duration_minutes,
+          grading_weights,
+          is_published,
+          created_by,
+          created_at,
+          simulation_questions (
+            id,
+            prompt,
+            image_url,
+            option_a,
+            option_b,
+            option_c,
+            option_d,
+            option_e,
+            correct_option,
+            position,
+            course_id,
+            course:exam_subjects (
+              id,
+              name,
+              slug,
+              sort_order
+            )
+          )
+        `
 
       let response = await supabase
         .from('simulations')
-        .select(subjectAndDurationSimulationSelect)
+        .select(fullSimulationSelect)
         .order('created_at', { ascending: false })
+
+      if (
+        response.error
+        && (
+          response.error?.code === '42703'
+          || /grading_weights/i.test(response.error?.message ?? '')
+        )
+      ) {
+        setSimulationGradingSchemaReady(false)
+        response = await supabase
+          .from('simulations')
+          .select(subjectAndDurationSimulationSelect)
+          .order('created_at', { ascending: false })
+      } else {
+        setSimulationGradingSchemaReady(true)
+      }
 
       if (
         response.error
@@ -1072,6 +1238,14 @@ function App() {
   const publicPath = getPublicPath()
   const hasExistingTemplate = (template) => exams.some((exam) => isTemplatePreparation(exam, template))
   const isAdmin = isSimulationAdminUser(session?.user?.id)
+  const guardedSetView = useCallback((nextView) => {
+    if (simulationNavigationLocked && nextView !== 'weekly-sim') {
+      showToast('Termina o finaliza el simulacro antes de salir.', 'info')
+      return
+    }
+
+    setView(nextView)
+  }, [showToast, simulationNavigationLocked])
 
   if (publicPath) {
     return <PublicRoute path={publicPath} isLoggedIn={Boolean(session)} />
@@ -1507,11 +1681,13 @@ function App() {
 
   const startNewSimulation = () => {
     setSimulationDraft(createEmptySimulationDraft())
+    setSelectedWeightSubjectId('')
   }
 
   const editSimulation = (simulation) => {
     setSimulationDraft(simulationToDraft(simulation))
     setActiveSimulationId(simulation.id)
+    setSelectedWeightSubjectId('')
   }
 
   const saveSimulation = (event) => {
@@ -1530,6 +1706,11 @@ function App() {
       position: index,
     }))
     const hasQuestionsWithoutSubject = validQuestions.some((question) => !question.subjectId)
+    const subjectIdsInDraft = new Set(validQuestions.map((question) => question.subjectId).filter(Boolean))
+    const sanitizedGradingWeights = Object.fromEntries(
+      Object.entries(normalizeGradingWeights(simulationDraft.gradingWeights))
+        .filter(([subjectId]) => subjectIdsInDraft.has(subjectId)),
+    )
 
     if (!title) {
       showToast('Escribe el nombre del simulacro.', 'error')
@@ -1537,7 +1718,7 @@ function App() {
     }
 
     if (!Number.isFinite(durationMinutes) || durationMinutes < 1) {
-      showToast('Define una duracion valida para el simulacro.', 'error')
+      showToast('Define una duración válida para el simulacro.', 'error')
       return
     }
 
@@ -1555,7 +1736,7 @@ function App() {
       simulationSubjectSchemaReady
       && simulationDraft.id
       && hasQuestionsWithoutSubject
-      && !window.confirm('Hay preguntas sin curso asignado. Esto afectara las estadisticas por curso. ¿Deseas guardar de todos modos?')
+      && !window.confirm('Hay preguntas sin curso asignado. Esto afectará las estadísticas por curso. ¿Deseas guardar de todos modos?')
     ) {
       return
     }
@@ -1571,13 +1752,16 @@ function App() {
       const simulationPayloadWithDuration = simulationDurationSchemaReady
         ? { ...simulationPayload, duration_minutes: Math.round(durationMinutes) }
         : simulationPayload
+      const simulationPayloadWithGrading = simulationGradingSchemaReady
+        ? { ...simulationPayloadWithDuration, grading_weights: sanitizedGradingWeights }
+        : simulationPayloadWithDuration
 
       let simulationId = simulationDraft.id
 
       if (simulationId) {
         const { error } = await supabase
           .from('simulations')
-          .update(simulationPayloadWithDuration)
+          .update(simulationPayloadWithGrading)
           .eq('id', simulationId)
         if (error) throw error
 
@@ -1589,7 +1773,7 @@ function App() {
       } else {
         const { data, error } = await supabase
           .from('simulations')
-          .insert({ ...simulationPayloadWithDuration, created_by: session.user.id })
+          .insert({ ...simulationPayloadWithGrading, created_by: session.user.id })
           .select('id')
           .single()
         if (error) throw error
@@ -1628,7 +1812,7 @@ function App() {
 
   const deleteSimulation = (simulationId) => {
     if (!isAdmin || !supabase) return
-    if (!window.confirm('Eliminar este simulacro tambien quitara sus preguntas e intentos registrados.')) return
+    if (!window.confirm('Eliminar este simulacro también quitará sus preguntas e intentos registrados.')) return
 
     runAction(`delete-simulation-${simulationId}`, async () => {
       const { error } = await supabase.from('simulations').delete().eq('id', simulationId)
@@ -1650,15 +1834,28 @@ function App() {
     }))
   }
 
+  const resetSimulationAttempt = (simulationId) => {
+    setSimulationAnswers((current) => {
+      const next = { ...current }
+      delete next[simulationId]
+      return next
+    })
+    setSimulationResults((current) => {
+      const next = { ...current }
+      delete next[simulationId]
+      return next
+    })
+  }
+
   const submitSimulationAttempt = (simulation, options = {}) => {
-    if (!session?.user?.id || !supabase) return
+    if (!session?.user?.id || !supabase) return null
     const answers = simulationAnswers[simulation.id] ?? {}
     const allowIncomplete = Boolean(options.allowIncomplete)
     const isTimedOut = options.reason === 'timeout'
 
     if (!allowIncomplete && simulation.questions.some((question) => !answers[question.id])) {
       showToast('Responde todas las preguntas antes de terminar.', 'error')
-      return
+      return null
     }
 
     const result = calculateSimulationResult(simulation, answers)
@@ -1685,6 +1882,8 @@ function App() {
         isTimedOut ? 'info' : 'success',
       )
     })
+
+    return result
   }
 
   if (!isSupabaseConfigured) {
@@ -1726,13 +1925,14 @@ function App() {
         exams={exams}
         activeExam={activeExam}
         view={view}
-        setView={setView}
+        setView={guardedSetView}
         setActiveExamId={setActiveExamId}
         onOpenSettings={openSettings}
         onLogout={handleLogout}
         logoutLoading={actionLoading === 'logout'}
         daysLeft={daysLeft}
         userStats={userStats}
+        navigationLocked={simulationNavigationLocked}
       >
         <DashboardSkeleton />
         <Toast toast={toast} />
@@ -1777,7 +1977,7 @@ function App() {
       exams={exams}
       activeExam={activeExam}
       view={view}
-      setView={setView}
+      setView={guardedSetView}
       setActiveExamId={setActiveExamId}
       onOpenSettings={openSettings}
       onLogout={handleLogout}
@@ -1785,6 +1985,7 @@ function App() {
       daysLeft={daysLeft}
       userStats={userStats}
       dataLoading={dataLoading}
+      navigationLocked={simulationNavigationLocked}
     >
       {view === 'new-exam' ? (
         <section className="page-narrow reveal">
@@ -1829,6 +2030,7 @@ function App() {
           isAdmin={isAdmin}
           activeSimulationId={activeSimulationId}
           setActiveSimulationId={setActiveSimulationId}
+          setNavigationLocked={setSimulationNavigationLocked}
           draft={simulationDraft}
           setDraft={setSimulationDraft}
           subjects={examSubjects}
@@ -1836,6 +2038,7 @@ function App() {
           subjectsLoading={examSubjectsLoading}
           subjectSchemaReady={simulationSubjectSchemaReady}
           durationSchemaReady={simulationDurationSchemaReady}
+          gradingSchemaReady={simulationGradingSchemaReady}
           answers={simulationAnswers}
           results={simulationResults}
           attempts={simulationAttempts}
@@ -1848,6 +2051,7 @@ function App() {
           onEditSimulation={editSimulation}
           onSaveSimulation={saveSimulation}
           onDeleteSimulation={deleteSimulation}
+          onResetAttempt={resetSimulationAttempt}
           onSetAnswer={setSimulationAnswer}
           onSubmitAttempt={submitSimulationAttempt}
           actionLoading={actionLoading}
@@ -2298,11 +2502,16 @@ function AppFrame({
   daysLeft,
   userStats,
   dataLoading,
+  navigationLocked = false,
 }) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
 
   return (
-    <div className={sidebarCollapsed ? 'app-shell sidebar-collapsed' : 'app-shell'}>
+    <div className={[
+      'app-shell',
+      sidebarCollapsed ? 'sidebar-collapsed' : '',
+      navigationLocked ? 'exam-locked' : '',
+    ].filter(Boolean).join(' ')}>
       <aside className="sidebar">
         <div className="sidebar-header">
           <div className="sidebar-brand-copy">
@@ -2325,6 +2534,7 @@ function AppFrame({
               <button
                 key={exam.id}
                 className={exam.id === activeExam?.id ? 'exam-chip active' : 'exam-chip'}
+                disabled={navigationLocked}
                 onClick={() => {
                   setActiveExamId(exam.id)
                   setView('home')
@@ -2338,15 +2548,15 @@ function AppFrame({
         )}
 
         <div className="sidebar-actions">
-          <Button className="secondary-btn full" onClick={() => setView('new-exam')}>
+          <Button className="secondary-btn full" onClick={() => setView('new-exam')} disabled={navigationLocked}>
             <Plus size={18} />
             <span>Nueva preparacion</span>
           </Button>
-          <Button className="ghost-btn full" onClick={onOpenSettings} disabled={!activeExam}>
+          <Button className="ghost-btn full" onClick={onOpenSettings} disabled={!activeExam || navigationLocked}>
             <Settings size={18} />
             <span>Configuracion</span>
           </Button>
-          <Button className="ghost-btn full" onClick={onLogout} loading={logoutLoading}>
+          <Button className="ghost-btn full" onClick={onLogout} loading={logoutLoading} disabled={navigationLocked}>
             <LogOut size={18} />
             <span>Salir</span>
           </Button>
@@ -2356,23 +2566,23 @@ function AppFrame({
       <div className="workspace">
         <header className="topbar">
           <nav className="tabs" aria-label="Navegacion principal">
-            <button className={view === 'home' ? 'tab active' : 'tab'} onClick={() => setView('home')}>
+            <button className={view === 'home' ? 'tab active' : 'tab'} onClick={() => setView('home')} disabled={navigationLocked}>
               <LayoutDashboard size={17} />
               Inicio
             </button>
-            <button className={view === 'courses' ? 'tab active' : 'tab'} onClick={() => setView('courses')}>
+            <button className={view === 'courses' ? 'tab active' : 'tab'} onClick={() => setView('courses')} disabled={navigationLocked}>
               <BookOpen size={17} />
               Cursos
             </button>
-            <button className={view === 'weekly-sim' ? 'tab active' : 'tab'} onClick={() => setView('weekly-sim')}>
+            <button className={view === 'weekly-sim' ? 'tab active' : 'tab'} onClick={() => setView('weekly-sim')} disabled={navigationLocked}>
               <FileText size={17} />
               Simulacro
             </button>
-            <button className={view === 'weekly-ranking' ? 'tab active' : 'tab'} onClick={() => setView('weekly-ranking')}>
+            <button className={view === 'weekly-ranking' ? 'tab active' : 'tab'} onClick={() => setView('weekly-ranking')} disabled={navigationLocked}>
               <BarChart3 size={17} />
               Ranking
             </button>
-            <button className={view === 'global' ? 'tab active' : 'tab'} onClick={() => setView('global')}>
+            <button className={view === 'global' ? 'tab active' : 'tab'} onClick={() => setView('global')} disabled={navigationLocked}>
               <Users size={17} />
               Global
             </button>
@@ -3098,6 +3308,7 @@ function WeeklySimulationPage({
   isAdmin,
   activeSimulationId,
   setActiveSimulationId,
+  setNavigationLocked,
   draft,
   setDraft,
   subjects,
@@ -3105,6 +3316,7 @@ function WeeklySimulationPage({
   subjectsLoading,
   subjectSchemaReady,
   durationSchemaReady,
+  gradingSchemaReady,
   answers,
   results,
   attempts,
@@ -3117,6 +3329,7 @@ function WeeklySimulationPage({
   onEditSimulation,
   onSaveSimulation,
   onDeleteSimulation,
+  onResetAttempt,
   onSetAnswer,
   onSubmitAttempt,
   actionLoading,
@@ -3124,7 +3337,28 @@ function WeeklySimulationPage({
   const [mode, setMode] = useState('student')
   const [simulationTimers, setSimulationTimers] = useState({})
   const [timedOutSimulations, setTimedOutSimulations] = useState({})
+  const [startedSimulationId, setStartedSimulationId] = useState(null)
+  const [activeQuestionIndex, setActiveQuestionIndex] = useState(0)
+  const [activeEditorQuestionIndex, setActiveEditorQuestionIndex] = useState(0)
+  const [editorQuestionQuery, setEditorQuestionQuery] = useState('')
+  const [selectedWeightSubjectId, setSelectedWeightSubjectId] = useState('')
+  const [studentView, setStudentView] = useState('library')
+  const [selectedAttemptId, setSelectedAttemptId] = useState('latest')
+  const [studentSimulationQuery, setStudentSimulationQuery] = useState('')
+  const [statsQuery, setStatsQuery] = useState('')
+  const [statsFilter, setStatsFilter] = useState('all')
+  const [completionFeedback, setCompletionFeedback] = useState(null)
   const visibleSimulations = simulations.filter((simulation) => simulation.isPublished)
+  const filteredVisibleSimulations = visibleSimulations.filter((simulation) => {
+    const query = studentSimulationQuery.trim().toLowerCase()
+    if (!query) return true
+
+    return (
+      simulation.title.toLowerCase().includes(query)
+      || simulation.description.toLowerCase().includes(query)
+      || simulation.questions.some((question) => (question.subjectName || '').toLowerCase().includes(query))
+    )
+  })
   const managedSimulations = simulations
   const activeSimulation = visibleSimulations.find((simulation) => simulation.id === activeSimulationId) ?? visibleSimulations[0] ?? null
   const activeAnswers = activeSimulation ? (answers[activeSimulation.id] ?? {}) : {}
@@ -3144,13 +3378,15 @@ function WeeklySimulationPage({
       subjectStats: calculateSubjectStats(latestAttempt.answers, activeSimulation.questions),
     }
   }, [activeAttempts, activeSimulation, currentAttemptResult])
-  const selectedCount = Object.keys(activeAnswers).length
   const activeDurationSeconds = activeSimulation ? Math.max(60, Math.round(activeSimulation.durationMinutes || 60) * 60) : 0
   const remainingSeconds = activeSimulation
     ? simulationTimers[activeSimulation.id] ?? activeDurationSeconds
     : 0
   const isCurrentAttemptClosed = Boolean(currentAttemptResult)
+  const isExamRunning = Boolean(activeSimulation && startedSimulationId === activeSimulation.id && !isCurrentAttemptClosed)
   const timerTone = remainingSeconds <= 60 ? 'critical' : remainingSeconds <= 300 ? 'warning' : ''
+  const activeQuestion = activeSimulation?.questions[activeQuestionIndex] ?? activeSimulation?.questions[0] ?? null
+  const activeDraftQuestion = draft.questions[activeEditorQuestionIndex] ?? draft.questions[0] ?? null
   const activeRankingRows = activeSimulation
     ? (rankings ?? [])
       .filter((row) => row.simulationId === activeSimulation.id)
@@ -3159,29 +3395,203 @@ function WeeklySimulationPage({
     : []
   const activeUserRank = activeRankingRows.find((row) => row.userId === currentUserId)?.rank ?? null
   const activeSubjectAnalytics = activeSimulation ? (subjectAnalytics?.[activeSimulation.id] ?? []) : []
-  const activeSubjectComparisons = useMemo(
-    () => buildSubjectComparisons(activeResult?.subjectStats ?? [], activeSubjectAnalytics),
-    [activeResult, activeSubjectAnalytics],
+  const activeAttemptDetails = useMemo(() => {
+    if (!activeSimulation) return []
+
+    const savedAttempts = activeAttempts.map((attempt, index) => ({
+      ...attempt,
+      attemptLabel: `Intento ${activeAttempts.length - index}`,
+      subjectStats: calculateSubjectStats(attempt.answers, activeSimulation.questions),
+      isCurrent: false,
+    }))
+
+    if (!currentAttemptResult) return savedAttempts
+
+    return [
+      {
+        id: 'current-result',
+        simulationId: activeSimulation.id,
+        attemptLabel: 'Resultado reciente',
+        answers: activeAnswers,
+        score: currentAttemptResult.score,
+        correctCount: currentAttemptResult.correctCount,
+        questionCount: currentAttemptResult.questionCount,
+        completedAt: new Date().toISOString(),
+        subjectStats: currentAttemptResult.subjectStats,
+        isCurrent: true,
+      },
+      ...savedAttempts,
+    ]
+  }, [activeAnswers, activeAttempts, activeSimulation, currentAttemptResult])
+  const selectedAttempt = useMemo(() => {
+    if (!activeAttemptDetails.length) return null
+    if (selectedAttemptId === 'latest') return activeAttemptDetails[0]
+    return activeAttemptDetails.find((attempt) => attempt.id === selectedAttemptId) ?? activeAttemptDetails[0]
+  }, [activeAttemptDetails, selectedAttemptId])
+  const previousAttempt = useMemo(() => {
+    if (!selectedAttempt) return null
+    const selectedIndex = activeAttemptDetails.findIndex((attempt) => attempt.id === selectedAttempt.id)
+    return selectedIndex >= 0 ? activeAttemptDetails[selectedIndex + 1] ?? null : null
+  }, [activeAttemptDetails, selectedAttempt])
+  const selectedSubjectComparisons = useMemo(() => {
+    const previousBySubject = new Map((previousAttempt?.subjectStats ?? []).map((stat) => [stat.subjectKey, stat]))
+
+    return buildSubjectComparisons(selectedAttempt?.subjectStats ?? [], activeSubjectAnalytics).map((stat) => {
+      const previous = previousBySubject.get(stat.subjectKey)
+      const internalDifference = previous ? Number((stat.percentage - previous.percentage).toFixed(1)) : null
+
+      return {
+        ...stat,
+        previousPercentage: previous?.percentage ?? null,
+        internalDifference,
+      }
+    })
+  }, [activeSubjectAnalytics, previousAttempt, selectedAttempt])
+  const selectedDiagnosis = useMemo(
+    () => buildCourseDiagnosis(selectedAttempt?.subjectStats ?? [], selectedSubjectComparisons),
+    [selectedAttempt, selectedSubjectComparisons],
   )
-  const activeDiagnosis = useMemo(
-    () => buildCourseDiagnosis(activeResult?.subjectStats ?? [], activeSubjectComparisons),
-    [activeResult, activeSubjectComparisons],
-  )
+  const filteredSelectedSubjects = useMemo(() => {
+    const query = statsQuery.trim().toLowerCase()
+
+    return selectedSubjectComparisons.filter((stat) => {
+      const matchesQuery = !query || stat.subjectName.toLowerCase().includes(query)
+      const matchesFilter = statsFilter === 'all'
+        || (statsFilter === 'critical' && (stat.status.key === 'critical' || stat.priority.key === 'max'))
+        || (statsFilter === 'reinforce' && (stat.status.key === 'regular' || stat.priority.key === 'soon'))
+        || (statsFilter === 'strong' && stat.status.key === 'excellent')
+
+      return matchesQuery && matchesFilter
+    })
+  }, [selectedSubjectComparisons, statsFilter, statsQuery])
+  const selectedScorePercentage = selectedAttempt && activeSimulation?.scoreMax
+    ? Math.round((selectedAttempt.score / activeSimulation.scoreMax) * 100)
+    : 0
+  const bestAttemptScore = activeAttempts.length
+    ? Math.max(...activeAttempts.map((attempt) => attempt.score))
+    : selectedAttempt?.score ?? 0
+  const averageAttemptScore = activeAttempts.length
+    ? Number((activeAttempts.reduce((sum, attempt) => sum + attempt.score, 0) / activeAttempts.length).toFixed(2))
+    : selectedAttempt?.score ?? 0
+  const strongestSubjects = selectedSubjectComparisons.filter((stat) => stat.status.key === 'excellent')
+  const criticalSubjects = selectedSubjectComparisons.filter((stat) => stat.status.key === 'critical' || stat.priority.key === 'max')
   const hasDraftQuestionsWithoutSubject = draft.questions.some((question) => !question.subjectId)
   const subjectSelectDisabled = !subjectSchemaReady || !subjectsReady || subjectsLoading
+  const subjectById = useMemo(
+    () => new Map((subjects ?? []).map((subject) => [subject.id, subject])),
+    [subjects],
+  )
+  const getDraftQuestionSubject = (question) => {
+    const subject = subjectById.get(question?.subjectId)
+    return subject?.name || question?.subjectName || UNASSIGNED_SUBJECT.name
+  }
+  const filteredDraftQuestionIndexes = draft.questions
+    .map((question, index) => ({ question, index, subjectName: getDraftQuestionSubject(question) }))
+    .filter(({ question, index, subjectName }) => {
+      const query = editorQuestionQuery.trim().toLowerCase()
+      if (!query) return true
+      return (
+        String(index + 1).includes(query)
+        || question.prompt.toLowerCase().includes(query)
+        || subjectName.toLowerCase().includes(query)
+      )
+    })
+  const draftQuestionGroups = filteredDraftQuestionIndexes.reduce((groups, item) => {
+    const key = item.subjectName || UNASSIGNED_SUBJECT.name
+    groups[key] = groups[key] ?? []
+    groups[key].push(item)
+    return groups
+  }, {})
+  const draftSubjectOptions = Array.from(draft.questions.reduce((groups, question) => {
+    if (!question.subjectId) return groups
+    const current = groups.get(question.subjectId) ?? {
+      subjectId: question.subjectId,
+      subjectName: getDraftQuestionSubject(question),
+      questionCount: 0,
+    }
+
+    current.questionCount += 1
+    groups.set(question.subjectId, current)
+    return groups
+  }, new Map()).values())
+    .sort((a, b) => a.subjectName.localeCompare(b.subjectName, 'es'))
+  const activeWeightSubjectId = draftSubjectOptions.some((subject) => subject.subjectId === selectedWeightSubjectId)
+    ? selectedWeightSubjectId
+    : draftSubjectOptions[0]?.subjectId || ''
+  const activeWeightBonus = Number(draft.gradingWeights?.[activeWeightSubjectId] ?? 0)
+  const draftPointPreview = useMemo(() => {
+    const previewQuestions = draft.questions.map((question) => ({
+      ...question,
+      subjectName: getDraftQuestionSubject(question),
+    }))
+
+    return calculateQuestionPointValues({
+      ...draft,
+      questions: previewQuestions,
+      scoreMax: Number(draft.scoreMax) || 20,
+      gradingWeights: draft.gradingWeights,
+    })
+  }, [draft, subjectById])
+  const selectedWeightPreview = draftPointPreview.subjectPointSummary
+    .find((subject) => subject.subjectId === activeWeightSubjectId)
+  const unassignedDraftQuestionCount = draft.questions.filter((question) => !question.subjectId).length
+  const updateGradingWeight = (subjectId, value) => {
+    const amount = Math.max(0, Number(value) || 0)
+
+    setDraft((current) => {
+      const nextWeights = { ...normalizeGradingWeights(current.gradingWeights) }
+      if (!subjectId || amount <= 0) {
+        delete nextWeights[subjectId]
+      } else {
+        nextWeights[subjectId] = Number(amount.toFixed(2))
+      }
+
+      return { ...current, gradingWeights: nextWeights }
+    })
+  }
 
   useEffect(() => {
-    if (!activeSimulation || isCurrentAttemptClosed) return
+    setNavigationLocked?.(isExamRunning)
+    return () => setNavigationLocked?.(false)
+  }, [isExamRunning, setNavigationLocked])
+
+  useEffect(() => {
+    setSelectedAttemptId('latest')
+    setStatsQuery('')
+    setStatsFilter('all')
+    setCompletionFeedback(null)
+  }, [activeSimulation?.id])
+
+  useEffect(() => {
+    if (!completionFeedback) return undefined
+
+    const timeout = window.setTimeout(() => {
+      setStudentView('stats')
+      setSelectedAttemptId('latest')
+      setCompletionFeedback(null)
+    }, 2300)
+
+    return () => window.clearTimeout(timeout)
+  }, [completionFeedback])
+
+  useEffect(() => {
+    if (activeEditorQuestionIndex > draft.questions.length - 1) {
+      setActiveEditorQuestionIndex(Math.max(0, draft.questions.length - 1))
+    }
+  }, [activeEditorQuestionIndex, draft.questions.length])
+
+  useEffect(() => {
+    if (!activeSimulation || !isExamRunning) return
 
     setSimulationTimers((current) => (
       current[activeSimulation.id] == null
         ? { ...current, [activeSimulation.id]: activeDurationSeconds }
         : current
     ))
-  }, [activeDurationSeconds, activeSimulation, isCurrentAttemptClosed])
+  }, [activeDurationSeconds, activeSimulation, isExamRunning])
 
   useEffect(() => {
-    if (!activeSimulation || isCurrentAttemptClosed) return undefined
+    if (!activeSimulation || !isExamRunning) return undefined
 
     const interval = window.setInterval(() => {
       setSimulationTimers((current) => {
@@ -3194,15 +3604,26 @@ function WeeklySimulationPage({
     }, 1000)
 
     return () => window.clearInterval(interval)
-  }, [activeDurationSeconds, activeSimulation, isCurrentAttemptClosed])
+  }, [activeDurationSeconds, activeSimulation, isExamRunning])
 
   useEffect(() => {
-    if (!activeSimulation || isCurrentAttemptClosed || remainingSeconds > 0 || timedOutSimulations[activeSimulation.id]) return
+    if (!activeSimulation || !isExamRunning || remainingSeconds > 0 || timedOutSimulations[activeSimulation.id]) return
     if (actionLoading === `submit-simulation-${activeSimulation.id}`) return
 
     setTimedOutSimulations((current) => ({ ...current, [activeSimulation.id]: true }))
-    onSubmitAttempt(activeSimulation, { allowIncomplete: true, reason: 'timeout' })
-  }, [actionLoading, activeSimulation, isCurrentAttemptClosed, onSubmitAttempt, remainingSeconds, timedOutSimulations])
+    const result = onSubmitAttempt(activeSimulation, { allowIncomplete: true, reason: 'timeout' })
+    if (result) {
+      setStartedSimulationId(null)
+      setCompletionFeedback({
+        ...getSimulationScoreFeedback(result.score, activeSimulation.scoreMax),
+        eyebrow: 'Tiempo finalizado',
+        score: result.score,
+        scoreMax: activeSimulation.scoreMax,
+        correctCount: result.correctCount,
+        questionCount: result.questionCount,
+      })
+    }
+  }, [actionLoading, activeSimulation, isExamRunning, onSubmitAttempt, remainingSeconds, timedOutSimulations])
 
   const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }))
   const updateQuestion = (index, patch) => {
@@ -3224,10 +3645,12 @@ function WeeklySimulationPage({
     }))
   }
   const addQuestion = () => {
+    const nextQuestionIndex = draft.questions.length
     setDraft((current) => ({
       ...current,
       questions: [...current.questions, createEmptyQuestion(current.questions.length)],
     }))
+    setActiveEditorQuestionIndex(nextQuestionIndex)
   }
   const removeQuestion = (index) => {
     setDraft((current) => ({
@@ -3236,6 +3659,148 @@ function WeeklySimulationPage({
         ? current.questions.filter((_, questionIndex) => questionIndex !== index)
         : current.questions,
     }))
+    setActiveEditorQuestionIndex((current) => (
+      index < current ? current - 1 : Math.min(current, Math.max(0, draft.questions.length - 2))
+    ))
+  }
+  const startActiveSimulation = () => {
+    if (!activeSimulation) return
+
+    onResetAttempt?.(activeSimulation.id)
+    setStartedSimulationId(activeSimulation.id)
+    setActiveQuestionIndex(0)
+    setStudentView('detail')
+    setCompletionFeedback(null)
+    setTimedOutSimulations((current) => ({ ...current, [activeSimulation.id]: false }))
+    setSimulationTimers((current) => ({ ...current, [activeSimulation.id]: activeDurationSeconds }))
+  }
+  const goToQuestion = (index) => {
+    if (!activeSimulation) return
+    setActiveQuestionIndex(Math.min(Math.max(index, 0), activeSimulation.questions.length - 1))
+  }
+  const goToPreviousQuestion = () => goToQuestion(activeQuestionIndex - 1)
+  const goToNextQuestion = () => goToQuestion(activeQuestionIndex + 1)
+  const finishActiveSimulation = () => {
+    if (!activeSimulation) return
+    const result = onSubmitAttempt(activeSimulation)
+    if (!result) return
+
+    setStartedSimulationId(null)
+    setCompletionFeedback({
+      ...getSimulationScoreFeedback(result.score, activeSimulation.scoreMax),
+      score: result.score,
+      scoreMax: activeSimulation.scoreMax,
+      correctCount: result.correctCount,
+      questionCount: result.questionCount,
+    })
+  }
+
+  if (isExamRunning && activeSimulation && activeQuestion) {
+    const answeredCount = Object.keys(activeAnswers).length
+
+    return (
+      <main className="simulation-exam-screen">
+        <header className="simulation-exam-topbar">
+          <div>
+            <p className="eyebrow">Simulacro en curso</p>
+            <h1>{activeSimulation.title}</h1>
+          </div>
+          <span className={`simulation-exam-timer ${timerTone}`.trim()}>
+            <Clock size={18} />
+            {formatDuration(remainingSeconds)}
+          </span>
+        </header>
+
+        <section className="simulation-exam-layout">
+          <article className="simulation-exam-question">
+            <div className="simulation-question-head">
+              <span>{activeQuestionIndex + 1}</span>
+              <div className="simulation-question-copy">
+                <p>{activeQuestion.prompt}</p>
+                <small>{activeQuestion.subjectName || UNASSIGNED_SUBJECT.name}</small>
+              </div>
+            </div>
+
+            {activeQuestion.imageUrl && <img src={activeQuestion.imageUrl} alt="" />}
+
+            <div className="simulation-options">
+              {ANSWER_OPTIONS.map((option) => (
+                <button
+                  className={activeAnswers[activeQuestion.id] === option ? 'active' : ''}
+                  type="button"
+                  onClick={() => onSetAnswer(activeSimulation.id, activeQuestion.id, option)}
+                  key={option}
+                >
+                  <strong>{option}</strong>
+                  <span>{activeQuestion.options[option]}</span>
+                </button>
+              ))}
+            </div>
+
+            <div className="simulation-exam-actions">
+              <button className="secondary-btn" type="button" onClick={goToPreviousQuestion} disabled={activeQuestionIndex === 0}>
+                Atras
+              </button>
+              <button className="secondary-btn" type="button" onClick={goToNextQuestion} disabled={activeQuestionIndex >= activeSimulation.questions.length - 1}>
+                Siguiente
+              </button>
+            </div>
+          </article>
+
+          <aside className="simulation-question-map">
+            <div>
+              <p className="eyebrow">Navegación</p>
+              <h2>{answeredCount}/{activeSimulation.questions.length}</h2>
+              <span>preguntas respondidas</span>
+            </div>
+            <div className="question-map-grid">
+              {activeSimulation.questions.map((question, index) => (
+                <button
+                  className={[
+                    index === activeQuestionIndex ? 'active' : '',
+                    activeAnswers[question.id] ? 'answered' : '',
+                  ].filter(Boolean).join(' ')}
+                  type="button"
+                  onClick={() => goToQuestion(index)}
+                  key={question.id}
+                >
+                  {index + 1}
+                </button>
+              ))}
+            </div>
+            <Button
+              className="primary-btn full"
+              type="button"
+              onClick={finishActiveSimulation}
+              loading={actionLoading === `submit-simulation-${activeSimulation.id}`}
+            >
+              <Check size={18} />
+              Finalizar prueba
+            </Button>
+          </aside>
+        </section>
+      </main>
+    )
+  }
+
+  if (completionFeedback) {
+    return (
+      <main className={`simulation-completion-screen ${completionFeedback.tone}`}>
+        <section className="simulation-completion-card">
+          <div className="completion-orbit">
+            <LoaderCircle size={34} />
+          </div>
+          <p className="eyebrow">{completionFeedback.eyebrow}</p>
+          <h1>{completionFeedback.title}</h1>
+          <strong>{completionFeedback.score}/{completionFeedback.scoreMax}</strong>
+          <p>{completionFeedback.correctCount} de {completionFeedback.questionCount} correctas. {completionFeedback.message}</p>
+          <div className="completion-progress" aria-hidden="true">
+            <span />
+          </div>
+          <small>Preparando tu diagnóstico por curso, comparación global e historial de intentos...</small>
+        </section>
+      </main>
+    )
   }
 
   return (
@@ -3244,7 +3809,7 @@ function WeeklySimulationPage({
         <div>
           <p className="eyebrow">Simulacros generales</p>
           <h1>Simulacros</h1>
-          <p>Practicas publicadas para todos los usuarios, con nota inmediata y ranking global por simulacro.</p>
+          <p>Prácticas publicadas para todos los usuarios, con nota inmediata y ranking global por simulacro.</p>
         </div>
         {isAdmin && <span className="admin-badge">Admin de simulacros</span>}
       </section>
@@ -3284,7 +3849,7 @@ function WeeklySimulationPage({
                 <input value={draft.title} onChange={(event) => updateDraft('title', event.target.value)} placeholder="Ej. Simulacro UNI 01" />
               </label>
               <label>
-                Puntaje maximo
+                Puntaje máximo
                 <input
                   type="number"
                   min="1"
@@ -3295,7 +3860,7 @@ function WeeklySimulationPage({
                 />
               </label>
               <label>
-                Duracion del examen (min)
+                Duración del examen (min)
                 <input
                   type="number"
                   min="1"
@@ -3317,15 +3882,16 @@ function WeeklySimulationPage({
             </div>
 
             <label>
-              Descripcion
+              Descripción
               <textarea
                 value={draft.description}
                 onChange={(event) => updateDraft('description', event.target.value)}
-                placeholder="Describe alcance, reglas o duracion sugerida."
+                placeholder="Describe el alcance, las reglas o la duración sugerida."
               />
             </label>
 
             <ImageInput label="Imagen del simulacro" value={draft.imageUrl} onChange={(value) => updateDraft('imageUrl', value)} />
+            {draft.imageUrl && <img className="simulation-draft-cover-preview" src={draft.imageUrl} alt="" />}
 
             {!subjectSchemaReady && (
               <div className="template-warning">
@@ -3335,44 +3901,193 @@ function WeeklySimulationPage({
 
             {!durationSchemaReady && (
               <div className="template-warning">
-                Ejecuta supabase/simulado_subject_analytics.sql para guardar la duracion de cada simulacro.
+                Ejecuta supabase/simulado_subject_analytics.sql para guardar la duración de cada simulacro.
               </div>
             )}
 
             {subjectSchemaReady && hasDraftQuestionsWithoutSubject && (
               <div className="template-warning">
-                Hay preguntas sin curso asignado. Esto afectara las estadisticas por curso.
+                Hay preguntas sin curso asignado. Esto afectará las estadísticas por curso.
               </div>
             )}
 
-            <div className="question-editor-list">
-              {draft.questions.map((question, index) => (
-                <article className="question-editor" key={question.id}>
+            {!gradingSchemaReady && (
+              <div className="template-warning">
+                Ejecuta supabase/simulation_grading_weights.sql para activar la ponderación de nota por curso.
+              </div>
+            )}
+
+            <section className="grading-weight-panel">
+              <div className="section-heading compact">
+                <div>
+                  <p className="eyebrow">Validación de nota</p>
+                  <h3>Ponderación por curso</h3>
+                  <p>Sube el valor de cursos clave y el resto se ajusta para que la nota máxima siga sumando {Number(draft.scoreMax) || 20} puntos.</p>
+                </div>
+              </div>
+
+              <div className="grading-weight-controls">
+                <label>
+                  Curso a ponderar
+                  <select
+                    value={activeWeightSubjectId}
+                    onChange={(event) => setSelectedWeightSubjectId(event.target.value)}
+                    disabled={!draftSubjectOptions.length || !gradingSchemaReady}
+                  >
+                    {!draftSubjectOptions.length && <option value="">Asigna cursos a tus preguntas</option>}
+                    {draftSubjectOptions.map((subject) => (
+                      <option value={subject.subjectId} key={subject.subjectId}>
+                        {subject.subjectName} ({subject.questionCount} preg.)
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label>
+                  Aumento por pregunta
+                  <input
+                    type="number"
+                    min="0"
+                    max="10"
+                    step="0.25"
+                    value={activeWeightBonus}
+                    onChange={(event) => updateGradingWeight(activeWeightSubjectId, event.target.value)}
+                    disabled={!activeWeightSubjectId || !gradingSchemaReady}
+                  />
+                </label>
+
+                <div className="grading-weight-preview">
+                  <span>Valor actual</span>
+                  <strong>{selectedWeightPreview ? `${selectedWeightPreview.pointPerQuestion.toFixed(2)} pts` : 'Sin curso'}</strong>
+                  <small>por pregunta seleccionada</small>
+                </div>
+              </div>
+
+              <div className="grading-weight-list">
+                {draftPointPreview.subjectPointSummary.map((subject) => (
+                  <article className={subject.bonus > 0 ? 'weighted' : ''} key={subject.subjectId || subject.subjectName}>
+                    <div>
+                      <strong>{subject.subjectName}</strong>
+                      <span>{subject.questionCount} pregunta(s)</span>
+                    </div>
+                    <div>
+                      <strong>{subject.pointPerQuestion.toFixed(2)} pts</strong>
+                      <span>{subject.totalPoints.toFixed(2)} pts total</span>
+                    </div>
+                    {subject.bonus > 0 && <em>+{subject.bonus.toFixed(2)} por pregunta</em>}
+                  </article>
+                ))}
+              </div>
+            </section>
+
+            <section className="question-editor-workbench">
+              <aside className="question-editor-map" aria-label="Navegación de preguntas">
+                <div className="question-map-head">
+                  <div>
+                    <p className="eyebrow">Mapa de preguntas</p>
+                    <h3>{draft.questions.length} pregunta(s)</h3>
+                  </div>
+                  {unassignedDraftQuestionCount > 0 && (
+                    <span>{unassignedDraftQuestionCount} sin curso</span>
+                  )}
+                </div>
+
+                <label className="question-map-search">
+                  Buscar por número, curso o texto
+                  <div className="course-search">
+                    <Search size={17} />
+                    <input
+                      value={editorQuestionQuery}
+                      onChange={(event) => setEditorQuestionQuery(event.target.value)}
+                      placeholder="Ej. Álgebra, 32..."
+                    />
+                  </div>
+                </label>
+
+                <div className="admin-question-groups">
+                  {Object.entries(draftQuestionGroups).map(([subjectName, items]) => (
+                    <section className="admin-question-group" key={subjectName}>
+                      <div>
+                        <strong>{subjectName}</strong>
+                        <span>{items.length}</span>
+                      </div>
+                      <div className="admin-question-grid">
+                        {items.map(({ question, index }) => (
+                          <button
+                            className={[
+                              index === activeEditorQuestionIndex ? 'active' : '',
+                              question.subjectId ? 'assigned' : 'missing-subject',
+                            ].filter(Boolean).join(' ')}
+                            type="button"
+                            onClick={() => setActiveEditorQuestionIndex(index)}
+                            key={question.id}
+                          >
+                            {index + 1}
+                          </button>
+                        ))}
+                      </div>
+                    </section>
+                  ))}
+
+                  {!filteredDraftQuestionIndexes.length && (
+                    <div className="empty-state small">
+                      <h2>Sin coincidencias</h2>
+                      <p>Prueba con otro número, curso o fragmento de texto.</p>
+                    </div>
+                  )}
+                </div>
+              </aside>
+
+              {activeDraftQuestion && (
+                <article className="question-editor active-question-editor" key={activeDraftQuestion.id}>
                   <div className="question-editor-head">
-                    <span>Pregunta {index + 1}</span>
-                    <button className="icon-btn" type="button" aria-label="Eliminar pregunta" onClick={() => removeQuestion(index)}>
-                      <Trash2 size={16} />
-                    </button>
+                    <div>
+                      <span>Pregunta {activeEditorQuestionIndex + 1}</span>
+                      <small>{getDraftQuestionSubject(activeDraftQuestion)}</small>
+                    </div>
+                    <div className="question-editor-head-actions">
+                      <button
+                        className="icon-btn"
+                        type="button"
+                        aria-label="Pregunta anterior"
+                        onClick={() => setActiveEditorQuestionIndex((current) => Math.max(0, current - 1))}
+                        disabled={activeEditorQuestionIndex === 0}
+                      >
+                        <ChevronRight className="flip-icon" size={16} />
+                      </button>
+                      <button
+                        className="icon-btn"
+                        type="button"
+                        aria-label="Pregunta siguiente"
+                        onClick={() => setActiveEditorQuestionIndex((current) => Math.min(draft.questions.length - 1, current + 1))}
+                        disabled={activeEditorQuestionIndex >= draft.questions.length - 1}
+                      >
+                        <ChevronRight size={16} />
+                      </button>
+                      <button className="icon-btn" type="button" aria-label="Eliminar pregunta" onClick={() => removeQuestion(activeEditorQuestionIndex)}>
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
                   </div>
 
                   <label>
                     Texto de la pregunta
                     <textarea
-                      value={question.prompt}
-                      onChange={(event) => updateQuestion(index, { prompt: event.target.value })}
-                      placeholder="Escribe el enunciado."
+                      value={activeDraftQuestion.prompt}
+                      onChange={(event) => updateQuestion(activeEditorQuestionIndex, { prompt: event.target.value })}
+                      placeholder="Escribe el enunciado de la pregunta."
                     />
                   </label>
 
-                  <ImageInput label="Imagen de la pregunta" value={question.imageUrl} onChange={(value) => updateQuestion(index, { imageUrl: value })} />
+                  <ImageInput label="Imagen de la pregunta" value={activeDraftQuestion.imageUrl} onChange={(value) => updateQuestion(activeEditorQuestionIndex, { imageUrl: value })} />
 
                   <SubjectSelect
-                    value={question.subjectId}
+                    value={activeDraftQuestion.subjectId}
                     subjects={subjects}
                     disabled={subjectSelectDisabled}
                     required={subjectSchemaReady && !draft.id}
-                    showUnassignedWarning={subjectSchemaReady && !question.subjectId}
-                    onChange={(value) => updateQuestion(index, { subjectId: value })}
+                    showUnassignedWarning={subjectSchemaReady && !activeDraftQuestion.subjectId}
+                    onChange={(value) => updateQuestion(activeEditorQuestionIndex, { subjectId: value })}
                   />
 
                   <div className="answer-grid">
@@ -3380,27 +4095,27 @@ function WeeklySimulationPage({
                       <label key={option}>
                         Alternativa {option}
                         <input
-                          value={question.options[option]}
-                          onChange={(event) => updateQuestionOption(index, option, event.target.value)}
+                          value={activeDraftQuestion.options[option]}
+                          onChange={(event) => updateQuestionOption(activeEditorQuestionIndex, option, event.target.value)}
                           placeholder={`Respuesta ${option}`}
                         />
                       </label>
                     ))}
                     <label>
                       Clave correcta
-                      <select value={question.correctOption} onChange={(event) => updateQuestion(index, { correctOption: event.target.value })}>
+                      <select value={activeDraftQuestion.correctOption} onChange={(event) => updateQuestion(activeEditorQuestionIndex, { correctOption: event.target.value })}>
                         {ANSWER_OPTIONS.map((option) => <option value={option} key={option}>{option}</option>)}
                       </select>
                     </label>
                   </div>
                 </article>
-              ))}
-            </div>
+              )}
+            </section>
 
             <div className="simulation-form-actions">
               <button className="secondary-btn" type="button" onClick={addQuestion}>
                 <Plus size={18} />
-                Anadir pregunta
+                Añadir pregunta
               </button>
               <Button className="primary-btn" type="submit" loading={actionLoading === 'save-simulation'}>
                 <Check size={18} />
@@ -3438,28 +4153,251 @@ function WeeklySimulationPage({
               ))}
               {!managedSimulations.length && (
                 <div className="empty-state small">
-                  <h2>Aun no hay simulacros</h2>
+                  <h2>Aún no hay simulacros</h2>
                   <p>Crea el primer simulacro global para que aparezca en la vista de estudiantes.</p>
                 </div>
               )}
             </div>
           </section>
         </section>
+      ) : studentView === 'stats' && activeSimulation ? (
+        <section className="simulation-stats-page">
+          <div className="simulation-stats-head">
+            <button className="secondary-btn" type="button" onClick={() => setStudentView('detail')}>
+              <ChevronRight className="flip-icon" size={17} />
+              Volver al simulacro
+            </button>
+            <div>
+              <p className="eyebrow">Estadisticas del simulacro</p>
+              <h2>{activeSimulation.title}</h2>
+              <span>{activeAttempts.length} intento(s) guardados</span>
+            </div>
+            <Button
+              className="primary-btn"
+              type="button"
+              onClick={startActiveSimulation}
+              disabled={!activeSimulation.questions.length}
+            >
+              <Clock size={18} />
+              Nuevo intento
+            </Button>
+          </div>
+
+          {!selectedAttempt ? (
+            <div className="empty-state small">
+              <h2>Aun no hay estadisticas</h2>
+              <p>Resuelve este simulacro para activar el diagnostico por curso, comparativas e historial de intentos.</p>
+            </div>
+          ) : (
+            <>
+              <section className="simulation-stats-hero">
+                <div>
+                  <p className="eyebrow">{selectedAttempt.attemptLabel}</p>
+                  <h3>{selectedAttempt.score}/{activeSimulation.scoreMax}</h3>
+                  <p>{selectedAttempt.correctCount} de {selectedAttempt.questionCount} correctas.</p>
+                  {activeUserRank && <span>Puesto actual en ranking: #{activeUserRank}</span>}
+                </div>
+
+                <div className="stats-score-ring" style={{ '--score': selectedScorePercentage }}>
+                  <strong>{selectedScorePercentage}%</strong>
+                  <span>acierto</span>
+                </div>
+
+                <div className="stats-kpi-grid">
+                  <article>
+                    <span>Mejor nota</span>
+                    <strong>{bestAttemptScore}/{activeSimulation.scoreMax}</strong>
+                  </article>
+                  <article>
+                    <span>Promedio de intentos</span>
+                    <strong>{averageAttemptScore}/{activeSimulation.scoreMax}</strong>
+                  </article>
+                  <article>
+                    <span>Cursos criticos</span>
+                    <strong>{criticalSubjects.length}</strong>
+                  </article>
+                  <article>
+                    <span>Cursos fuertes</span>
+                    <strong>{strongestSubjects.length}</strong>
+                  </article>
+                </div>
+              </section>
+
+              <section className="simulation-stats-toolbar">
+                <label>
+                  Muestra de intento
+                  <select value={selectedAttemptId} onChange={(event) => setSelectedAttemptId(event.target.value)}>
+                    <option value="latest">Ultimo resultado</option>
+                    {activeAttemptDetails.map((attempt) => (
+                      <option value={attempt.id} key={attempt.id}>
+                        {attempt.attemptLabel} - {attempt.score}/{activeSimulation.scoreMax}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label>
+                  Busqueda rapida
+                  <div className="course-search">
+                    <Search size={17} />
+                    <input
+                      value={statsQuery}
+                      onChange={(event) => setStatsQuery(event.target.value)}
+                      placeholder="Buscar curso..."
+                    />
+                  </div>
+                </label>
+
+                <div className="stats-filter-tabs" role="tablist" aria-label="Filtro de cursos">
+                  {[
+                    ['all', 'Todos'],
+                    ['critical', 'Criticos'],
+                    ['reinforce', 'Reforzar'],
+                    ['strong', 'Fuertes'],
+                  ].map(([key, label]) => (
+                    <button
+                      className={statsFilter === key ? 'active' : ''}
+                      type="button"
+                      onClick={() => setStatsFilter(key)}
+                      key={key}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              <section className="stats-insight-grid">
+                <article className="stats-insight-card critical">
+                  <p className="eyebrow">Cursos criticos</p>
+                  <h3>{criticalSubjects.length ? criticalSubjects.map((stat) => stat.subjectName).slice(0, 3).join(', ') : 'Sin cursos criticos'}</h3>
+                  <span>{selectedDiagnosis.topReason}</span>
+                </article>
+                <article className="stats-insight-card internal">
+                  <p className="eyebrow">Comparacion interna</p>
+                  <h3>{previousAttempt ? `Contra ${previousAttempt.attemptLabel}` : 'Primer intento registrado'}</h3>
+                  <span>
+                    {previousAttempt
+                      ? 'Cada curso muestra cuanto subiste o bajaste frente al intento anterior seleccionado.'
+                      : 'Cuando tengas otro intento, aqui veras tu avance estadistico curso por curso.'}
+                  </span>
+                </article>
+                <article className="stats-insight-card strong">
+                  <p className="eyebrow">Buen dominio</p>
+                  <h3>{strongestSubjects.length ? strongestSubjects.map((stat) => stat.subjectName).slice(0, 3).join(', ') : 'Aun sin cursos fuertes'}</h3>
+                  <span>Manten practica ligera en estos cursos para no perder estabilidad.</span>
+                </article>
+              </section>
+
+              <CourseDiagnosis diagnosis={selectedDiagnosis} />
+
+              <section className="subject-panel subject-detail-panel">
+                <div className="section-heading compact">
+                  <div>
+                    <p className="eyebrow">Detalle por curso</p>
+                    <h3>Rendimiento filtrado</h3>
+                  </div>
+                  <span className="stats-count-pill">{filteredSelectedSubjects.length} curso(s)</span>
+                </div>
+
+                <div className="subject-stats-grid">
+                  {filteredSelectedSubjects.map((stat) => (
+                    <article className={`subject-stats-card stats-subject-card subject-tone-${stat.status.key}`} key={stat.subjectKey}>
+                      <div className="subject-card-head">
+                        <div>
+                          <span>{stat.subjectName}</span>
+                          <strong>{formatPercentage(stat.percentage)}</strong>
+                        </div>
+                        <span className="subject-status-badge">{stat.status.label}</span>
+                      </div>
+                      <div className="subject-progress-bar" aria-label={`Avance ${stat.subjectName}`}>
+                        <span style={{ width: `${Math.min(Math.max(stat.percentage, 0), 100)}%` }} />
+                      </div>
+                      <div className="subject-card-metrics">
+                        <span>{stat.total} preguntas</span>
+                        <span>{stat.correct} correctas</span>
+                        <span>{stat.incorrect} incorrectas</span>
+                      </div>
+                      <div className="stats-subject-footer">
+                        <span className="subject-priority-pill">{stat.priority.label}</span>
+                        <span className={[
+                          'internal-delta',
+                          stat.internalDifference > 0 ? 'up' : '',
+                          stat.internalDifference < 0 ? 'down' : '',
+                        ].filter(Boolean).join(' ')}
+                        >
+                          {typeof stat.internalDifference === 'number'
+                            ? `${stat.internalDifference > 0 ? '+' : ''}${formatPercentage(stat.internalDifference)} vs intento previo`
+                            : 'Sin intento previo'}
+                        </span>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+
+                {!filteredSelectedSubjects.length && (
+                  <div className="comparison-empty">No hay cursos que coincidan con la busqueda o el filtro seleccionado.</div>
+                )}
+              </section>
+
+              <GlobalComparisonCard
+                comparisons={filteredSelectedSubjects}
+                loading={Boolean(subjectAnalyticsLoading?.[activeSimulation.id])}
+                error={subjectAnalyticsErrors?.[activeSimulation.id] ?? ''}
+              />
+
+              <section className="simulation-attempt-history expanded">
+                <div>
+                  <p className="eyebrow">Historial acumulado</p>
+                  <h3>{activeAttempts.length ? `${activeAttempts.length} intento(s)` : 'Sin intentos guardados'}</h3>
+                </div>
+                {activeAttempts.map((attempt, index) => (
+                  <button
+                    className={selectedAttempt?.id === attempt.id ? 'attempt-row active' : 'attempt-row'}
+                    type="button"
+                    onClick={() => setSelectedAttemptId(attempt.id)}
+                    key={attempt.id}
+                  >
+                    <strong>{attempt.score}/{activeSimulation.scoreMax}</strong>
+                    <span>{attempt.correctCount}/{attempt.questionCount} correctas</span>
+                    <small>{formatDate(attempt.completedAt?.slice(0, 10))}</small>
+                    <em>Intento {activeAttempts.length - index}</em>
+                  </button>
+                ))}
+              </section>
+            </>
+          )}
+        </section>
       ) : (
-        <section className="simulation-workspace">
-        <aside className="simulation-list" aria-label="Lista de simulacros">
+        <section className="simulation-workspace simulation-browser-workspace">
+        <aside className={studentView === 'detail' ? 'simulation-list library-hidden' : 'simulation-list'} aria-label="Lista de simulacros">
           <div className="section-heading compact">
             <div>
               <p className="eyebrow">Biblioteca</p>
-              <h2>{loading ? 'Cargando...' : `${visibleSimulations.length} simulacro(s)`}</h2>
+              <h2>{loading ? 'Cargando...' : `${filteredVisibleSimulations.length} de ${visibleSimulations.length} simulacro(s)`}</h2>
             </div>
           </div>
 
-          {visibleSimulations.map((simulation) => (
+          <label className="simulation-search-field">
+            Buscar simulacro
+            <div className="course-search">
+              <Search size={17} />
+              <input
+                value={studentSimulationQuery}
+                onChange={(event) => setStudentSimulationQuery(event.target.value)}
+                placeholder="Nombre, descripcion o curso..."
+              />
+            </div>
+          </label>
+
+          {filteredVisibleSimulations.map((simulation) => (
             <button
               className={simulation.id === activeSimulation?.id ? 'simulation-list-item active' : 'simulation-list-item'}
               type="button"
-              onClick={() => setActiveSimulationId(simulation.id)}
+              onClick={() => {
+                setActiveSimulationId(simulation.id)
+                setStudentView('detail')
+              }}
               key={simulation.id}
             >
               {simulation.imageUrl && <img src={simulation.imageUrl} alt="" />}
@@ -3469,98 +4407,80 @@ function WeeklySimulationPage({
             </button>
           ))}
 
-          {!loading && !visibleSimulations.length && (
+          {!loading && !filteredVisibleSimulations.length && (
             <div className="empty-state small">
-              <h2>No hay simulacros disponibles</h2>
-              <p>{isAdmin ? 'Crea el primero desde el panel admin.' : 'Vuelve pronto para practicar con nuevas pruebas.'}</p>
+              <h2>{visibleSimulations.length ? 'Sin coincidencias' : 'No hay simulacros disponibles'}</h2>
+              <p>{visibleSimulations.length ? 'Prueba con otro nombre, descripcion o curso.' : isAdmin ? 'Crea el primero desde el panel admin.' : 'Vuelve pronto para practicar con nuevas pruebas.'}</p>
             </div>
           )}
         </aside>
 
-        <section className="simulation-player">
-          {activeSimulation ? (
+        <section className={studentView === 'detail' ? 'simulation-player' : 'simulation-player library-hidden'}>
+          {studentView === 'detail' && activeSimulation ? (
             <>
-              <div className="simulation-player-head">
+              <div className="simulation-detail-toolbar">
+                <button className="secondary-btn" type="button" onClick={() => setStudentView('library')}>
+                  <ChevronRight className="flip-icon" size={17} />
+                  Volver a biblioteca
+                </button>
                 <div>
-                  <p className="eyebrow">Practica activa</p>
+                  <p className="eyebrow">Simulacro seleccionado</p>
                   <h2>{activeSimulation.title}</h2>
-                  <p>{activeSimulation.description || 'Sin descripcion.'}</p>
                 </div>
               </div>
 
-              {activeSimulation.imageUrl && <img className="simulation-cover" src={activeSimulation.imageUrl} alt="" />}
+              <article className="simulation-start-card">
+                <div className="simulation-player-head">
+                  <div>
+                    <p className="eyebrow">Descripción del simulacro</p>
+                    <h2>{activeSimulation.title}</h2>
+                    <p>{activeSimulation.description || 'Sin descripción.'}</p>
+                  </div>
+                </div>
 
-              <div className="simulation-progress-line">
-                <span>{selectedCount}/{activeSimulation.questions.length} respondidas</span>
-                <span>Nota sobre {activeSimulation.scoreMax}</span>
-                <span className={`simulation-timer ${timerTone}`.trim()}>
-                  <Clock size={16} />
-                  {isCurrentAttemptClosed ? 'Cerrado' : formatDuration(remainingSeconds)}
-                </span>
-              </div>
+                {activeSimulation.imageUrl && <img className="simulation-cover large" src={activeSimulation.imageUrl} alt="" />}
 
-              <div className="simulation-questions">
-                {activeSimulation.questions.map((question, index) => (
-                  <article className="simulation-question" key={question.id}>
-                    <div className="simulation-question-head">
-                      <span>{index + 1}</span>
-                      <div className="simulation-question-copy">
-                        <p>{question.prompt}</p>
-                        <small>{question.subjectName || UNASSIGNED_SUBJECT.name}</small>
-                      </div>
-                    </div>
-                    {question.imageUrl && <img src={question.imageUrl} alt="" />}
-                    <div className="simulation-options">
-                      {ANSWER_OPTIONS.map((option) => (
-                        <button
-                          className={activeAnswers[question.id] === option ? 'active' : ''}
-                          type="button"
-                          disabled={isCurrentAttemptClosed}
-                          onClick={() => onSetAnswer(activeSimulation.id, question.id, option)}
-                          key={option}
-                        >
-                          <strong>{option}</strong>
-                          <span>{question.options[option]}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </article>
-                ))}
-              </div>
+                <div className="simulation-start-metrics">
+                  <span>{activeSimulation.questions.length} preguntas</span>
+                  <span>Nota sobre {activeSimulation.scoreMax}</span>
+                  <span>{activeSimulation.durationMinutes} min</span>
+                </div>
+
+                <div className="simulation-start-actions">
+                  <Button
+                    className="primary-btn simulation-start-btn"
+                    type="button"
+                    onClick={startActiveSimulation}
+                    disabled={!activeSimulation.questions.length}
+                  >
+                    <Clock size={18} />
+                    Empezar simulacro
+                  </Button>
+                  <button
+                    className="secondary-btn simulation-start-btn"
+                    type="button"
+                    onClick={() => setStudentView('stats')}
+                    disabled={!activeAttemptDetails.length}
+                  >
+                    <BarChart3 size={18} />
+                    Ver estadisticas
+                  </button>
+                </div>
+              </article>
 
               {activeResult && (
-                <div className="simulation-result">
-                  <span>Nota final</span>
-                  <strong>{activeResult.score}/{activeSimulation.scoreMax}</strong>
-                  <p>{activeResult.correctCount} de {activeResult.questionCount} correctas.</p>
-                  {activeUserRank && <p>Puesto actual en ranking: #{activeUserRank}</p>}
+                <div className="simulation-result compact-result">
+                  <div>
+                    <span>Ultima nota</span>
+                    <strong>{activeResult.score}/{activeSimulation.scoreMax}</strong>
+                    <p>{activeResult.correctCount} de {activeResult.questionCount} correctas.</p>
+                    {activeUserRank && <p>Puesto actual en ranking: #{activeUserRank}</p>}
+                  </div>
+                  <button className="secondary-btn" type="button" onClick={() => setStudentView('stats')}>
+                    <BarChart3 size={18} />
+                    Ver analisis completo
+                  </button>
                 </div>
-              )}
-
-              {activeResult?.subjectStats?.length > 0 && (
-                <>
-                  <CourseDiagnosis diagnosis={activeDiagnosis} />
-
-                  <section className="subject-panel subject-detail-panel">
-                    <div className="section-heading compact">
-                      <div>
-                        <p className="eyebrow">Detalle</p>
-                        <h3>Rendimiento por curso</h3>
-                      </div>
-                    </div>
-                    <div className="subject-stats-grid">
-                      {activeSubjectComparisons.map((stat) => (
-                        <SubjectStatsCard stat={stat} key={stat.subjectKey} />
-                      ))}
-                    </div>
-                  </section>
-
-                  <GlobalComparisonCard
-                    comparisons={activeSubjectComparisons}
-                    loading={Boolean(subjectAnalyticsLoading?.[activeSimulation.id])}
-                    error={subjectAnalyticsErrors?.[activeSimulation.id] ?? ''}
-                  />
-                </>
               )}
 
               <section className="simulation-attempt-history">
@@ -3577,21 +4497,11 @@ function WeeklySimulationPage({
                 ))}
               </section>
 
-              <Button
-                className="primary-btn simulation-submit"
-                type="button"
-                onClick={() => onSubmitAttempt(activeSimulation)}
-                loading={actionLoading === `submit-simulation-${activeSimulation.id}`}
-                disabled={isCurrentAttemptClosed}
-              >
-                <Check size={18} />
-                {isCurrentAttemptClosed ? 'Intento cerrado' : 'Terminar y calcular nota'}
-              </Button>
             </>
           ) : (
             <div className="empty-state small">
               <h2>Selecciona un simulacro</h2>
-              <p>Cuando exista una practica, aqui podras resolverla y ver tu nota en tiempo real.</p>
+              <p>Cuando exista una práctica, aquí podrás resolverla y ver tu nota en tiempo real.</p>
             </div>
           )}
         </section>
