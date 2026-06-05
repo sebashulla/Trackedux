@@ -22,6 +22,7 @@ import {
   LogIn,
   LogOut,
   Mail,
+  Menu,
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
@@ -109,6 +110,19 @@ const formatDuration = (totalSeconds) => {
   const seconds = safeSeconds % 60
 
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+const formatElapsedDuration = (totalSeconds) => {
+  if (totalSeconds == null) return 'Sin tiempo'
+
+  const safeSeconds = Math.max(0, Math.round(Number(totalSeconds) || 0))
+  const hours = Math.floor(safeSeconds / 3600)
+  const minutes = Math.floor((safeSeconds % 3600) / 60)
+  const seconds = safeSeconds % 60
+
+  if (hours > 0) return `${hours} h ${minutes} min`
+  if (minutes > 0) return `${minutes} min ${String(seconds).padStart(2, '0')} s`
+  return `${seconds} s`
 }
 
 const getDisplayName = (session, profile) => {
@@ -575,6 +589,7 @@ const normalizeSimulationAttempt = (row) => ({
   score: Number(row.score ?? 0),
   correctCount: row.correct_count ?? 0,
   questionCount: row.question_count ?? 0,
+  durationSeconds: row.duration_seconds == null ? null : Number(row.duration_seconds),
   completedAt: row.completed_at,
 })
 
@@ -592,16 +607,23 @@ const normalizeSimulationSubjectAnalyticsRow = (row) => ({
   participantCount: row.participant_count ?? 0,
 })
 
-const normalizeSimulationRankingRow = (row) => ({
-  simulationId: row.simulation_id,
-  userId: row.user_id,
-  displayName: row.display_name ?? 'Estudiante',
-  bestScore: Number(row.best_score ?? 0),
-  bestCorrectCount: row.best_correct_count ?? 0,
-  questionCount: row.question_count ?? 0,
-  attemptCount: row.attempt_count ?? 0,
-  lastCompletedAt: row.last_completed_at,
-})
+const normalizeSimulationRankingRow = (row) => {
+  const firstAttemptScore = Number(row.first_attempt_score ?? row.best_score ?? 0)
+  const firstAttemptCorrectCount = row.first_attempt_correct_count ?? row.best_correct_count ?? 0
+
+  return {
+    simulationId: row.simulation_id,
+    userId: row.user_id,
+    displayName: row.display_name ?? 'Estudiante',
+    firstAttemptScore,
+    firstAttemptCorrectCount,
+    bestScore: firstAttemptScore,
+    bestCorrectCount: firstAttemptCorrectCount,
+    questionCount: row.question_count ?? 0,
+    attemptCount: row.attempt_count ?? 0,
+    lastCompletedAt: row.last_completed_at,
+  }
+}
 
 const PUBLIC_NAV_LINKS = [
   { href: '/acerca-de', label: 'Acerca de' },
@@ -1081,14 +1103,28 @@ function App() {
     if (!currentUserId || !supabase) return
 
     try {
-      const { data, error } = await supabase
+      let response = await supabase
         .from('simulation_attempts')
-        .select('id, simulation_id, answers, correct_count, question_count, score, completed_at')
+        .select('id, simulation_id, answers, correct_count, question_count, score, duration_seconds, completed_at')
         .eq('user_id', currentUserId)
         .order('completed_at', { ascending: false })
 
-      if (error) throw error
-      setSimulationAttempts((data ?? []).map(normalizeSimulationAttempt))
+      if (
+        response.error
+        && (
+          response.error?.code === '42703'
+          || /duration_seconds/i.test(response.error?.message ?? '')
+        )
+      ) {
+        response = await supabase
+          .from('simulation_attempts')
+          .select('id, simulation_id, answers, correct_count, question_count, score, completed_at')
+          .eq('user_id', currentUserId)
+          .order('completed_at', { ascending: false })
+      }
+
+      if (response.error) throw response.error
+      setSimulationAttempts((response.data ?? []).map(normalizeSimulationAttempt))
     } catch {
       setSimulationAttempts([])
     }
@@ -1681,13 +1717,11 @@ function App() {
 
   const startNewSimulation = () => {
     setSimulationDraft(createEmptySimulationDraft())
-    setSelectedWeightSubjectId('')
   }
 
   const editSimulation = (simulation) => {
     setSimulationDraft(simulationToDraft(simulation))
     setActiveSimulationId(simulation.id)
-    setSelectedWeightSubjectId('')
   }
 
   const saveSimulation = (event) => {
@@ -1852,24 +1886,47 @@ function App() {
     const answers = simulationAnswers[simulation.id] ?? {}
     const allowIncomplete = Boolean(options.allowIncomplete)
     const isTimedOut = options.reason === 'timeout'
+    const durationSeconds = options.durationSeconds == null ? null : Math.max(0, Math.round(Number(options.durationSeconds) || 0))
 
     if (!allowIncomplete && simulation.questions.some((question) => !answers[question.id])) {
       showToast('Responde todas las preguntas antes de terminar.', 'error')
       return null
     }
 
-    const result = calculateSimulationResult(simulation, answers)
+    const result = {
+      ...calculateSimulationResult(simulation, answers),
+      durationSeconds,
+    }
     setSimulationResults((current) => ({ ...current, [simulation.id]: result }))
 
     runAction(`submit-simulation-${simulation.id}`, async () => {
-      const { error } = await supabase.from('simulation_attempts').insert({
+      const attemptPayload = {
         simulation_id: simulation.id,
         user_id: session.user.id,
         answers,
         correct_count: result.correctCount,
         question_count: result.questionCount,
         score: result.score,
-      })
+      }
+
+      if (durationSeconds != null) {
+        attemptPayload.duration_seconds = durationSeconds
+      }
+
+      let { error } = await supabase.from('simulation_attempts').insert(attemptPayload)
+
+      if (
+        error
+        && (
+          error?.code === '42703'
+          || /duration_seconds/i.test(error?.message ?? '')
+        )
+      ) {
+        const fallbackPayload = { ...attemptPayload }
+        delete fallbackPayload.duration_seconds
+        const fallbackResponse = await supabase.from('simulation_attempts').insert(fallbackPayload)
+        error = fallbackResponse.error
+      }
 
       if (error) throw error
       await fetchSimulationAttempts()
@@ -2505,13 +2562,27 @@ function AppFrame({
   navigationLocked = false,
 }) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false)
+  const userFirstName = displayName.split(/\s+/)[0] || displayName
+  const goToView = (nextView) => {
+    setView(nextView)
+    setMobileDrawerOpen(false)
+  }
 
   return (
     <div className={[
       'app-shell',
       sidebarCollapsed ? 'sidebar-collapsed' : '',
+      mobileDrawerOpen ? 'mobile-drawer-open' : '',
       navigationLocked ? 'exam-locked' : '',
     ].filter(Boolean).join(' ')}>
+      <button
+        className="drawer-backdrop"
+        type="button"
+        aria-label="Cerrar menu"
+        onClick={() => setMobileDrawerOpen(false)}
+      />
+
       <aside className="sidebar">
         <div className="sidebar-header">
           <div className="sidebar-brand-copy">
@@ -2521,14 +2592,21 @@ function AppFrame({
           <button
             className="icon-btn sidebar-toggle"
             type="button"
-            aria-label={sidebarCollapsed ? 'Mostrar preparaciones' : 'Ocultar preparaciones'}
-            onClick={() => setSidebarCollapsed((current) => !current)}
+            aria-label={mobileDrawerOpen ? 'Cerrar menu' : sidebarCollapsed ? 'Mostrar preparaciones' : 'Ocultar preparaciones'}
+            onClick={() => {
+              if (mobileDrawerOpen) {
+                setMobileDrawerOpen(false)
+                return
+              }
+
+              setSidebarCollapsed((current) => !current)
+            }}
           >
-            {sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+            {mobileDrawerOpen ? <X size={18} /> : sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
           </button>
         </div>
 
-        {!sidebarCollapsed && (
+        {(!sidebarCollapsed || mobileDrawerOpen) && (
           <div className="exam-list" aria-label="Preparaciones">
             {exams.map((exam) => (
               <button
@@ -2537,7 +2615,7 @@ function AppFrame({
                 disabled={navigationLocked}
                 onClick={() => {
                   setActiveExamId(exam.id)
-                  setView('home')
+                  goToView('home')
                 }}
               >
                 <span>{exam.name}</span>
@@ -2548,15 +2626,30 @@ function AppFrame({
         )}
 
         <div className="sidebar-actions">
-          <Button className="secondary-btn full" onClick={() => setView('new-exam')} disabled={navigationLocked}>
+          <Button className="secondary-btn full" onClick={() => goToView('new-exam')} disabled={navigationLocked}>
             <Plus size={18} />
             <span>Nueva preparacion</span>
           </Button>
-          <Button className="ghost-btn full" onClick={onOpenSettings} disabled={!activeExam || navigationLocked}>
+          <Button
+            className="ghost-btn full"
+            onClick={() => {
+              setMobileDrawerOpen(false)
+              onOpenSettings()
+            }}
+            disabled={!activeExam || navigationLocked}
+          >
             <Settings size={18} />
             <span>Configuracion</span>
           </Button>
-          <Button className="ghost-btn full" onClick={onLogout} loading={logoutLoading} disabled={navigationLocked}>
+          <Button
+            className="ghost-btn full"
+            onClick={() => {
+              setMobileDrawerOpen(false)
+              onLogout()
+            }}
+            loading={logoutLoading}
+            disabled={navigationLocked}
+          >
             <LogOut size={18} />
             <span>Salir</span>
           </Button>
@@ -2564,25 +2657,42 @@ function AppFrame({
       </aside>
 
       <div className="workspace">
+        <header className="mobile-header">
+          <button
+            className="icon-btn mobile-menu-btn"
+            type="button"
+            aria-label="Abrir menu"
+            onClick={() => setMobileDrawerOpen(true)}
+            disabled={navigationLocked}
+          >
+            <Menu size={19} />
+          </button>
+          <BrandLockup small />
+          <div className="mobile-user-chip">
+            <span>{userFirstName}</span>
+            <small>{userStats?.streak.current ?? 0}d racha</small>
+          </div>
+        </header>
+
         <header className="topbar">
           <nav className="tabs" aria-label="Navegacion principal">
-            <button className={view === 'home' ? 'tab active' : 'tab'} onClick={() => setView('home')} disabled={navigationLocked}>
+            <button className={view === 'home' ? 'tab active' : 'tab'} onClick={() => goToView('home')} disabled={navigationLocked}>
               <LayoutDashboard size={17} />
               Inicio
             </button>
-            <button className={view === 'courses' ? 'tab active' : 'tab'} onClick={() => setView('courses')} disabled={navigationLocked}>
+            <button className={view === 'courses' ? 'tab active' : 'tab'} onClick={() => goToView('courses')} disabled={navigationLocked}>
               <BookOpen size={17} />
               Cursos
             </button>
-            <button className={view === 'weekly-sim' ? 'tab active' : 'tab'} onClick={() => setView('weekly-sim')} disabled={navigationLocked}>
+            <button className={view === 'weekly-sim' ? 'tab active' : 'tab'} onClick={() => goToView('weekly-sim')} disabled={navigationLocked}>
               <FileText size={17} />
               Simulacro
             </button>
-            <button className={view === 'weekly-ranking' ? 'tab active' : 'tab'} onClick={() => setView('weekly-ranking')} disabled={navigationLocked}>
+            <button className={view === 'weekly-ranking' ? 'tab active' : 'tab'} onClick={() => goToView('weekly-ranking')} disabled={navigationLocked}>
               <BarChart3 size={17} />
               Ranking
             </button>
-            <button className={view === 'global' ? 'tab active' : 'tab'} onClick={() => setView('global')} disabled={navigationLocked}>
+            <button className={view === 'global' ? 'tab active' : 'tab'} onClick={() => goToView('global')} disabled={navigationLocked}>
               <Users size={17} />
               Global
             </button>
@@ -2596,8 +2706,40 @@ function AppFrame({
 
         {children}
         <AppFooter />
+        <MobileBottomNav view={view} setView={goToView} navigationLocked={navigationLocked} />
       </div>
     </div>
+  )
+}
+
+function MobileBottomNav({ view, setView, navigationLocked }) {
+  const items = [
+    { key: 'home', label: 'Inicio', icon: LayoutDashboard },
+    { key: 'courses', label: 'Cursos', icon: BookOpen },
+    { key: 'weekly-sim', label: 'Simulacro', icon: FileText },
+    { key: 'weekly-ranking', label: 'Ranking', icon: BarChart3 },
+    { key: 'global', label: 'Global', icon: Users },
+  ]
+
+  return (
+    <nav className="mobile-bottom-nav" aria-label="Navegacion movil">
+      {items.map((item) => {
+        const Icon = item.icon
+
+        return (
+          <button
+            className={view === item.key ? 'active' : ''}
+            type="button"
+            onClick={() => setView(item.key)}
+            disabled={navigationLocked}
+            key={item.key}
+          >
+            <Icon size={19} />
+            <span>{item.label}</span>
+          </button>
+        )
+      })}
+    </nav>
   )
 }
 
@@ -3375,6 +3517,7 @@ function WeeklySimulationPage({
       score: latestAttempt.score,
       correctCount: latestAttempt.correctCount,
       questionCount: latestAttempt.questionCount,
+      durationSeconds: latestAttempt.durationSeconds,
       subjectStats: calculateSubjectStats(latestAttempt.answers, activeSimulation.questions),
     }
   }, [activeAttempts, activeSimulation, currentAttemptResult])
@@ -3390,7 +3533,7 @@ function WeeklySimulationPage({
   const activeRankingRows = activeSimulation
     ? (rankings ?? [])
       .filter((row) => row.simulationId === activeSimulation.id)
-      .sort((a, b) => b.bestScore - a.bestScore || b.bestCorrectCount - a.bestCorrectCount || a.displayName.localeCompare(b.displayName))
+      .sort((a, b) => b.firstAttemptScore - a.firstAttemptScore || b.firstAttemptCorrectCount - a.firstAttemptCorrectCount || a.displayName.localeCompare(b.displayName))
       .map((row, index) => ({ ...row, rank: index + 1 }))
     : []
   const activeUserRank = activeRankingRows.find((row) => row.userId === currentUserId)?.rank ?? null
@@ -3416,6 +3559,7 @@ function WeeklySimulationPage({
         score: currentAttemptResult.score,
         correctCount: currentAttemptResult.correctCount,
         questionCount: currentAttemptResult.questionCount,
+        durationSeconds: currentAttemptResult.durationSeconds,
         completedAt: new Date().toISOString(),
         subjectStats: currentAttemptResult.subjectStats,
         isCurrent: true,
@@ -3611,7 +3755,11 @@ function WeeklySimulationPage({
     if (actionLoading === `submit-simulation-${activeSimulation.id}`) return
 
     setTimedOutSimulations((current) => ({ ...current, [activeSimulation.id]: true }))
-    const result = onSubmitAttempt(activeSimulation, { allowIncomplete: true, reason: 'timeout' })
+    const result = onSubmitAttempt(activeSimulation, {
+      allowIncomplete: true,
+      reason: 'timeout',
+      durationSeconds: activeDurationSeconds,
+    })
     if (result) {
       setStartedSimulationId(null)
       setCompletionFeedback({
@@ -3623,7 +3771,7 @@ function WeeklySimulationPage({
         questionCount: result.questionCount,
       })
     }
-  }, [actionLoading, activeSimulation, isExamRunning, onSubmitAttempt, remainingSeconds, timedOutSimulations])
+  }, [actionLoading, activeDurationSeconds, activeSimulation, isExamRunning, onSubmitAttempt, remainingSeconds, timedOutSimulations])
 
   const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }))
   const updateQuestion = (index, patch) => {
@@ -3682,7 +3830,11 @@ function WeeklySimulationPage({
   const goToNextQuestion = () => goToQuestion(activeQuestionIndex + 1)
   const finishActiveSimulation = () => {
     if (!activeSimulation) return
-    const result = onSubmitAttempt(activeSimulation)
+    const elapsedSeconds = Math.min(
+      activeDurationSeconds,
+      Math.max(1, activeDurationSeconds - remainingSeconds),
+    )
+    const result = onSubmitAttempt(activeSimulation, { durationSeconds: elapsedSeconds })
     if (!result) return
 
     setStartedSimulationId(null)
@@ -4194,8 +4346,8 @@ function WeeklySimulationPage({
                 <div>
                   <p className="eyebrow">{selectedAttempt.attemptLabel}</p>
                   <h3>{selectedAttempt.score}/{activeSimulation.scoreMax}</h3>
-                  <p>{selectedAttempt.correctCount} de {selectedAttempt.questionCount} correctas.</p>
-                  {activeUserRank && <span>Puesto actual en ranking: #{activeUserRank}</span>}
+                  <p>{selectedAttempt.correctCount} de {selectedAttempt.questionCount} correctas. Tiempo: {formatElapsedDuration(selectedAttempt.durationSeconds)}.</p>
+                  {activeUserRank && <span>Puesto en ranking por primer intento: #{activeUserRank}</span>}
                 </div>
 
                 <div className="stats-score-ring" style={{ '--score': selectedScorePercentage }}>
@@ -4211,6 +4363,10 @@ function WeeklySimulationPage({
                   <article>
                     <span>Promedio de intentos</span>
                     <strong>{averageAttemptScore}/{activeSimulation.scoreMax}</strong>
+                  </article>
+                  <article>
+                    <span>Tiempo usado</span>
+                    <strong>{formatElapsedDuration(selectedAttempt.durationSeconds)}</strong>
                   </article>
                   <article>
                     <span>Cursos criticos</span>
@@ -4360,6 +4516,7 @@ function WeeklySimulationPage({
                   >
                     <strong>{attempt.score}/{activeSimulation.scoreMax}</strong>
                     <span>{attempt.correctCount}/{attempt.questionCount} correctas</span>
+                    <span>Tiempo {formatElapsedDuration(attempt.durationSeconds)}</span>
                     <small>{formatDate(attempt.completedAt?.slice(0, 10))}</small>
                     <em>Intento {activeAttempts.length - index}</em>
                   </button>
@@ -4446,6 +4603,14 @@ function WeeklySimulationPage({
                   <span>{activeSimulation.durationMinutes} min</span>
                 </div>
 
+                <div className="simulation-ranking-notice">
+                  <ShieldCheck size={18} />
+                  <div>
+                    <strong>Ranking justo</strong>
+                    <span>Solo la nota de tu primer intento se mostrara en el ranking. Los nuevos intentos se guardan para tus estadisticas.</span>
+                  </div>
+                </div>
+
                 <div className="simulation-start-actions">
                   <Button
                     className="primary-btn simulation-start-btn"
@@ -4473,8 +4638,8 @@ function WeeklySimulationPage({
                   <div>
                     <span>Ultima nota</span>
                     <strong>{activeResult.score}/{activeSimulation.scoreMax}</strong>
-                    <p>{activeResult.correctCount} de {activeResult.questionCount} correctas.</p>
-                    {activeUserRank && <p>Puesto actual en ranking: #{activeUserRank}</p>}
+                    <p>{activeResult.correctCount} de {activeResult.questionCount} correctas. Tiempo: {formatElapsedDuration(activeResult.durationSeconds)}.</p>
+                    {activeUserRank && <p>Puesto en ranking por primer intento: #{activeUserRank}</p>}
                   </div>
                   <button className="secondary-btn" type="button" onClick={() => setStudentView('stats')}>
                     <BarChart3 size={18} />
@@ -4491,7 +4656,7 @@ function WeeklySimulationPage({
                 {activeAttempts.slice(0, 5).map((attempt) => (
                   <article className="attempt-row" key={attempt.id}>
                     <strong>{attempt.score}/{activeSimulation.scoreMax}</strong>
-                    <span>{attempt.correctCount}/{attempt.questionCount} correctas</span>
+                    <span>{attempt.correctCount}/{attempt.questionCount} correctas / {formatElapsedDuration(attempt.durationSeconds)}</span>
                     <small>{formatDate(attempt.completedAt?.slice(0, 10))}</small>
                   </article>
                 ))}
@@ -4585,7 +4750,7 @@ function LegacyWeeklySimulationRankingPage({ exam }) {
             <span>precisión</span>
           </div>
           <div className="leader-best">
-            <span>Mejor intento</span>
+            <span>Primer intento</span>
             <strong>--</strong>
           </div>
         </article>
@@ -4627,14 +4792,14 @@ function WeeklySimulationRankingPage({
   const activeRows = activeSimulation
     ? rankings
       .filter((row) => row.simulationId === activeSimulation.id)
-      .sort((a, b) => b.bestScore - a.bestScore || b.bestCorrectCount - a.bestCorrectCount || a.displayName.localeCompare(b.displayName))
+      .sort((a, b) => b.firstAttemptScore - a.firstAttemptScore || b.firstAttemptCorrectCount - a.firstAttemptCorrectCount || a.displayName.localeCompare(b.displayName))
     : []
   const rankedRows = activeRows.map((row, index) => ({ ...row, rank: index + 1 }))
   const filteredRows = rankedRows.filter((row) => row.displayName.toLowerCase().includes(query.trim().toLowerCase()))
   const activeSubjectAnalytics = activeSimulation ? (subjectAnalytics?.[activeSimulation.id] ?? []) : []
   const subjectRowsWithAverage = activeSubjectAnalytics.filter((row) => row.globalAverage !== null && row.globalUserCount > 0)
-  const averageBestScore = activeRows.length
-    ? Number((activeRows.reduce((sum, row) => sum + row.bestScore, 0) / activeRows.length).toFixed(2))
+  const averageFirstAttemptScore = activeRows.length
+    ? Number((activeRows.reduce((sum, row) => sum + row.firstAttemptScore, 0) / activeRows.length).toFixed(2))
     : null
   const highestSubject = subjectRowsWithAverage.reduce((best, row) => (
     !best || row.globalAverage > best.globalAverage ? row : best
@@ -4649,7 +4814,7 @@ function WeeklySimulationRankingPage({
         <div>
           <p className="eyebrow">Rankings por simulacro</p>
           <h1>Ranking</h1>
-          <p>Elige un simulacro global y compara el mejor intento de cada usuario.</p>
+          <p>Elige un simulacro global y compara solo el primer intento de cada usuario.</p>
         </div>
         <span className="global-summary">
           <Trophy size={18} />
@@ -4711,8 +4876,8 @@ function WeeklySimulationRankingPage({
               <section className="ranking-analytics-panel">
                 <div className="ranking-analytics-grid">
                   <article>
-                    <span>Promedio general</span>
-                    <strong>{averageBestScore == null ? 'Sin datos' : `${averageBestScore}/${activeSimulation.scoreMax}`}</strong>
+                    <span>Promedio primer intento</span>
+                    <strong>{averageFirstAttemptScore == null ? 'Sin datos' : `${averageFirstAttemptScore}/${activeSimulation.scoreMax}`}</strong>
                   </article>
                   <article>
                     <span>Mayor promedio por curso</span>
@@ -4760,16 +4925,16 @@ function WeeklySimulationRankingPage({
                     <span className="leader-avatar">{row.displayName.slice(0, 1).toUpperCase()}</span>
                     <div className="leader-name">
                       <strong>{row.displayName}</strong>
-                      <span>{row.attemptCount} intento(s) / ultimo {formatDate(row.lastCompletedAt?.slice(0, 10))}</span>
+                      <span>{row.attemptCount} intento(s) / ranking por primer intento</span>
                     </div>
                     <div className="leader-streak">
                       <Trophy size={21} />
-                      <strong>{row.bestScore}</strong>
-                      <span>mejor nota</span>
+                      <strong>{row.firstAttemptScore}</strong>
+                      <span>primer intento</span>
                     </div>
                     <div className="leader-best">
                       <span>Aciertos</span>
-                      <strong>{row.bestCorrectCount}/{row.questionCount}</strong>
+                      <strong>{row.firstAttemptCorrectCount}/{row.questionCount}</strong>
                     </div>
                   </article>
                 ))}
@@ -4785,7 +4950,7 @@ function WeeklySimulationRankingPage({
           ) : (
             <div className="empty-state small">
               <h2>Selecciona un simulacro</h2>
-              <p>Los rankings son generales para todos los usuarios.</p>
+              <p>Los rankings usan solo el primer intento de cada usuario.</p>
             </div>
           )}
         </section>

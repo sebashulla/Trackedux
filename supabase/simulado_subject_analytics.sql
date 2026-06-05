@@ -125,7 +125,81 @@ begin
     create index if not exists simulation_questions_course_id_idx
       on public.simulation_questions(course_id);
   end if;
+
+  if to_regclass('public.simulation_attempts') is not null then
+    alter table public.simulation_attempts
+      add column if not exists duration_seconds integer;
+
+    if not exists (
+      select 1
+      from pg_constraint
+      where conname = 'simulation_attempts_duration_seconds_check'
+    ) then
+      alter table public.simulation_attempts
+        add constraint simulation_attempts_duration_seconds_check
+        check (duration_seconds is null or duration_seconds >= 0);
+    end if;
+
+    create index if not exists simulation_attempts_first_attempt_idx
+      on public.simulation_attempts(simulation_id, user_id, completed_at);
+  end if;
 end $$;
+
+create or replace function public.get_simulation_rankings()
+returns table (
+  simulation_id uuid,
+  user_id uuid,
+  display_name text,
+  best_score numeric,
+  best_correct_count integer,
+  question_count integer,
+  attempt_count integer,
+  last_completed_at timestamptz
+)
+language sql
+security definer
+set search_path = public
+as $$
+  with ranked_attempts as (
+    select
+      attempts.simulation_id,
+      attempts.user_id,
+      attempts.score,
+      attempts.correct_count,
+      attempts.question_count,
+      attempts.completed_at,
+      row_number() over (
+        partition by attempts.simulation_id, attempts.user_id
+        order by attempts.completed_at asc, attempts.id asc
+      ) as attempt_rank,
+      count(*) over (
+        partition by attempts.simulation_id, attempts.user_id
+      )::integer as attempt_count,
+      max(attempts.completed_at) over (
+        partition by attempts.simulation_id, attempts.user_id
+      ) as last_completed_at
+    from public.simulation_attempts attempts
+    join public.simulations simulations
+      on simulations.id = attempts.simulation_id
+    where simulations.is_published = true
+  )
+  select
+    ranked_attempts.simulation_id,
+    ranked_attempts.user_id,
+    coalesce(profiles.display_name, 'Estudiante') as display_name,
+    ranked_attempts.score as best_score,
+    ranked_attempts.correct_count as best_correct_count,
+    ranked_attempts.question_count,
+    ranked_attempts.attempt_count,
+    ranked_attempts.last_completed_at
+  from ranked_attempts
+  left join public.profiles profiles
+    on profiles.id = ranked_attempts.user_id
+  where ranked_attempts.attempt_rank = 1
+  order by ranked_attempts.score desc, ranked_attempts.correct_count desc, ranked_attempts.completed_at asc, display_name asc;
+$$;
+
+grant execute on function public.get_simulation_rankings() to authenticated;
 
 create or replace function public.get_simulation_subject_averages(target_simulation_id uuid)
 returns table (
@@ -221,11 +295,11 @@ as $$
       attempt_subject_scores.*,
       row_number() over (
         partition by attempt_subject_scores.user_id, attempt_subject_scores.subject_key
-        order by attempt_subject_scores.percentage desc, attempt_subject_scores.correct_count desc, attempt_subject_scores.completed_at asc
+        order by attempt_subject_scores.completed_at asc, attempt_subject_scores.attempt_id asc
       ) as attempt_rank
     from attempt_subject_scores
   ),
-  best_user_subjects as (
+  first_user_subjects as (
     select *
     from ranked_user_subjects
     where attempt_rank = 1
@@ -235,7 +309,7 @@ as $$
       subject_key,
       round(avg(percentage), 2) as average_percentage,
       count(*)::integer as user_count
-    from best_user_subjects
+    from first_user_subjects
     group by subject_key
   ),
   peer_summary as (
@@ -243,7 +317,7 @@ as $$
       subject_key,
       round(avg(percentage), 2) as average_percentage,
       count(*)::integer as user_count
-    from best_user_subjects
+    from first_user_subjects
     where user_id <> auth.uid()
     group by subject_key
   ),
@@ -253,10 +327,10 @@ as $$
       user_id,
       rank() over (
         partition by subject_key
-        order by percentage desc, correct_count desc, completed_at asc
+        order by percentage desc, correct_count desc, completed_at asc, attempt_id asc
       )::integer as subject_rank,
       count(*) over (partition by subject_key)::integer as participant_count
-    from best_user_subjects
+    from first_user_subjects
   )
   select
     target_simulation_id as simulation_id,
