@@ -21,6 +21,7 @@ build/
 supabase/
 !supabase/
 !supabase/simulado_subject_analytics.sql
+!supabase/flashcards_module.sql
 *.db
 *.sqlite
 *.sqlite3

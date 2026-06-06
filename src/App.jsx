@@ -3,6 +3,7 @@ import {
   ArrowRight,
   BarChart3,
   BookOpen,
+  BookOpenCheck,
   BriefcaseBusiness,
   Bug,
   CalendarDays,
@@ -44,6 +45,7 @@ import StatusBadge from './components/StatusBadge'
 import SubjectSelect from './components/SubjectSelect'
 import GlobalComparisonCard from './components/GlobalComparisonCard'
 import CourseDiagnosis from './components/CourseDiagnosis'
+import FlashcardsPage from './pages/FlashcardsPage'
 import { EXAM_TEMPLATES, OFFICIAL_TEMPLATE_STRUCTURE_NOTE, TOPIC_STATUS_OPTIONS, getExamTemplateByCode, getTemplateFormDefaults } from './data/examTemplates'
 import { EXAM_SUBJECTS_WITH_FALLBACK_IDS, UNASSIGNED_SUBJECT } from './data/subjects'
 import { createPreparationFromTemplate } from './lib/templateService'
@@ -2126,6 +2128,12 @@ function App() {
           subjectAnalyticsLoading={simulationSubjectAnalyticsLoading}
           subjectAnalyticsErrors={simulationSubjectAnalyticsErrors}
         />
+      ) : view === 'flashcards' ? (
+        <FlashcardsPage
+          currentUserId={session.user.id}
+          exam={activeExam}
+          showToast={showToast}
+        />
       ) : view === 'global' ? (
         <GlobalPage
           entries={leaderboardEntries}
@@ -2692,6 +2700,10 @@ function AppFrame({
               <BarChart3 size={17} />
               Ranking
             </button>
+            <button className={view === 'flashcards' ? 'tab active' : 'tab'} onClick={() => goToView('flashcards')} disabled={navigationLocked}>
+              <BookOpenCheck size={17} />
+              Repaso
+            </button>
             <button className={view === 'global' ? 'tab active' : 'tab'} onClick={() => goToView('global')} disabled={navigationLocked}>
               <Users size={17} />
               Global
@@ -2718,6 +2730,7 @@ function MobileBottomNav({ view, setView, navigationLocked }) {
     { key: 'courses', label: 'Cursos', icon: BookOpen },
     { key: 'weekly-sim', label: 'Simulacro', icon: FileText },
     { key: 'weekly-ranking', label: 'Ranking', icon: BarChart3 },
+    { key: 'flashcards', label: 'Repaso', icon: BookOpenCheck },
     { key: 'global', label: 'Global', icon: Users },
   ]
 
